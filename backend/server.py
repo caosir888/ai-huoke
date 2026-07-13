@@ -7,6 +7,8 @@ import sys
 import uuid
 import json
 import asyncio
+import mimetypes
+from pathlib import Path
 from datetime import datetime, timedelta
 
 import httpx
@@ -21,6 +23,7 @@ DEEPSEEK_MODEL = "deepseek-chat"
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, delete
@@ -35,6 +38,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Uploads directory
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 # SQLite async engine
 DATABASE_URL = "sqlite+aiosqlite:///./aihuoke.db"
@@ -411,19 +419,46 @@ async def parse_link(req: ParseLinkReq, user: dict = Depends(get_token_user)):
 @app.post("/content/materials/upload")
 async def upload_material(file: UploadFile = File(...), folder_id: str | None = Form(None), user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
+
+    # Detect file type from extension
+    ext = Path(file.filename or "unknown").suffix.lower()
+    if ext in (".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv"):
+        ftype = "video"
+    elif ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
+        ftype = "image"
+    elif ext in (".mp3", ".wav", ".aac", ".ogg", ".m4a"):
+        ftype = "audio"
+    else:
+        ftype = "other"
+
+    # Create user upload subdirectory
+    user_dir = UPLOAD_DIR / user["id"]
+    user_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save file to disk
+    safe_name = f"{uuid.uuid4().hex}_{file.filename}"
+    file_path = user_dir / safe_name
+    content = await file.read()
+    file_path.write_bytes(content)
+    file_size = len(content)
+
     mid = str(uuid.uuid4())
-    file_url = f"/uploads/{user['id']}/{file.filename}"
+    rel_url = f"/uploads/{user['id']}/{safe_name}"
     now = datetime.utcnow().isoformat()
+
     await db.execute(text(
         "INSERT INTO materials (id, user_id, folder_id, type, file_name, file_url, size, duration, tags, created_at) VALUES (:id, :uid, :fid, :type, :name, :url, :size, :dur, '{}', :now)"
-    ), {"id": mid, "uid": user["id"], "fid": folder_id, "type": "video", "name": file.filename, "url": file_url, "size": file.size or 0, "dur": None, "now": now})
+    ), {"id": mid, "uid": user["id"], "fid": folder_id, "type": ftype, "name": file.filename, "url": rel_url, "size": file_size, "dur": None, "now": now})
     await db.commit()
-    return {"id": mid, "type": "video", "file_name": file.filename, "file_url": file_url, "thumbnail_url": None, "duration": None, "size": file.size or 0, "tags": [], "created_at": now}
+    return {"id": mid, "type": ftype, "file_name": file.filename, "file_url": rel_url, "thumbnail_url": None, "duration": None, "size": file_size, "tags": [], "created_at": now}
 
 @app.get("/content/materials")
-async def list_materials(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+async def list_materials(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db), type: str | None = None):
     from sqlalchemy import text
-    result = await db.execute(text("SELECT id, type, file_name, file_url, thumbnail_url, duration, size, tags, created_at FROM materials WHERE user_id = :uid ORDER BY created_at DESC LIMIT 100"), {"uid": user["id"]})
+    if type:
+        result = await db.execute(text("SELECT id, type, file_name, file_url, thumbnail_url, duration, size, tags, created_at FROM materials WHERE user_id = :uid AND type = :type ORDER BY created_at DESC LIMIT 100"), {"uid": user["id"], "type": type})
+    else:
+        result = await db.execute(text("SELECT id, type, file_name, file_url, thumbnail_url, duration, size, tags, created_at FROM materials WHERE user_id = :uid ORDER BY created_at DESC LIMIT 100"), {"uid": user["id"]})
     rows = result.fetchall()
     return [{"id": r[0], "type": r[1], "file_name": r[2], "file_url": r[3], "thumbnail_url": r[4], "duration": r[5], "size": r[6], "tags": r[7].split(",") if isinstance(r[7], str) else [], "created_at": r[8]} for r in rows]
 

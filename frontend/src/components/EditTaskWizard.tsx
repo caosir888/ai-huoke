@@ -127,7 +127,9 @@ export default function EditTaskWizard({ open, onClose, onCreated }: Props) {
               ))}
               {materials.filter(m => m.type === 'video').length === 0 && (
                 <div style={{ width: '100%', textAlign: 'center', color: '#999', padding: 40 }}>
-                  暂无可用的视频素材，请先在素材库上传
+                  <p style={{ fontSize: 14, marginBottom: 12 }}>暂无可用的视频素材</p>
+                  <p style={{ fontSize: 12 }}>请在「素材库」中上传 MP4/MOV/AVI 格式的视频文件（至少3段），然后再来创建混剪任务。</p>
+                  <p style={{ fontSize: 12, color: '#fa8c16' }}>注意：图片文件不适用于视频混剪，请上传视频素材。</p>
                 </div>
               )}
             </Row>
