@@ -490,16 +490,52 @@ async def create_edit_task(req: CreateEditTaskReq, user: dict = Depends(get_toke
     from sqlalchemy import text
     tid = str(uuid.uuid4())
     now = now_cst().isoformat()
-    await db.execute(text("INSERT INTO edit_tasks (id, user_id, material_ids, copywriting_id, template_id, params, status, progress, output_urls, created_at) VALUES (:id, :uid, :mids, :cid, :tid, :params, 'pending', 0, '{}', :now)"), {"id": tid, "uid": user["id"], "mids": ",".join(req.material_ids), "cid": req.copywriting_id, "tid": req.template_id, "params": req.model_dump_json(), "now": now})
+    await db.execute(text("INSERT INTO edit_tasks (id, user_id, material_ids, copywriting_id, template_id, params, status, progress, output_urls, created_at) VALUES (:id, :uid, :mids, :cid, :tid, :params, 'pending', 0, '', :now)"), {"id": tid, "uid": user["id"], "mids": ",".join(req.material_ids), "cid": req.copywriting_id, "tid": req.template_id, "params": req.model_dump_json(), "now": now})
     await db.commit()
+
+    # Fire background simulation
+    asyncio.create_task(_simulate_edit(tid, req.count, user["id"]))
+
     return {"id": tid, "material_ids": req.material_ids, "status": "pending", "progress": 0, "output_urls": [], "error_message": None, "created_at": now}
+
+async def _simulate_edit(task_id: str, count: int, user_id: str):
+    """Simulate video editing: pending → processing → done with mock output."""
+    import random
+    from sqlalchemy import text as sql_text
+
+    async with async_session() as db:
+        try:
+            # Mark as processing
+            await db.execute(sql_text("UPDATE edit_tasks SET status='processing', progress=5 WHERE id=:id"), {"id": task_id})
+            await db.commit()
+
+            # Simulate incremental progress over ~10 seconds
+            steps = random.randint(5, 10)
+            for i in range(1, steps + 1):
+                await asyncio.sleep(random.uniform(0.8, 2.0))
+                progress = min(5 + int(90 * i / steps), 99)
+                await db.execute(sql_text("UPDATE edit_tasks SET progress=:p WHERE id=:id"), {"p": progress, "id": task_id})
+                await db.commit()
+
+            # Generate mock output URLs
+            output_urls = [f"/videos/{user_id}/output_{task_id[:8]}_{j+1:03d}.mp4" for j in range(count)]
+            await db.execute(sql_text(
+                "UPDATE edit_tasks SET status='done', progress=100, output_urls=:urls WHERE id=:id"
+            ), {"urls": ",".join(output_urls), "id": task_id})
+            await db.commit()
+
+        except Exception as e:
+            await db.execute(sql_text(
+                "UPDATE edit_tasks SET status='failed', error_message=:msg WHERE id=:id"
+            ), {"msg": str(e), "id": task_id})
+            await db.commit()
 
 @app.get("/content/edit-tasks")
 async def list_edit_tasks(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
     result = await db.execute(text("SELECT id, material_ids, status, progress, output_urls, error_message, created_at FROM edit_tasks WHERE user_id = :uid ORDER BY created_at DESC LIMIT 50"), {"uid": user["id"]})
     rows = result.fetchall()
-    return [{"id": r[0], "material_ids": r[1].split(",") if isinstance(r[1], str) else [], "status": r[2], "progress": r[3], "output_urls": r[4].split(",") if isinstance(r[4], str) and r[4] else [], "error_message": r[5], "created_at": r[6]} for r in rows]
+    return [{"id": r[0], "material_ids": r[1].split(",") if isinstance(r[1], str) and r[1] else [], "status": r[2], "progress": r[3], "output_urls": r[4].split(",") if isinstance(r[4], str) and r[4] else [], "error_message": r[5], "created_at": r[6]} for r in rows]
 
 # ============ Publish ============
 
