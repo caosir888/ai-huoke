@@ -51,6 +51,11 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
+# Videos output directory
+VIDEOS_DIR = Path("videos")
+VIDEOS_DIR.mkdir(exist_ok=True)
+app.mount("/videos", StaticFiles(directory=str(VIDEOS_DIR)), name="videos")
+
 # SQLite async engine
 DATABASE_URL = "sqlite+aiosqlite:///./aihuoke.db"
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -499,12 +504,24 @@ async def create_edit_task(req: CreateEditTaskReq, user: dict = Depends(get_toke
     return {"id": tid, "material_ids": req.material_ids, "status": "pending", "progress": 0, "output_urls": [], "error_message": None, "created_at": now}
 
 async def _simulate_edit(task_id: str, count: int, user_id: str):
-    """Simulate video editing: pending → processing → done with mock output."""
+    """Simulate video editing: pending → processing → done with playable output."""
     import random
+    import shutil
     from sqlalchemy import text as sql_text
 
     async with async_session() as db:
         try:
+            # Fetch material_ids for this task
+            result = await db.execute(sql_text("SELECT material_ids FROM edit_tasks WHERE id=:id"), {"id": task_id})
+            row = result.fetchone()
+            src_url = None
+            if row and row[0]:
+                first_mat_id = row[0].split(",")[0]
+                mat_result = await db.execute(sql_text("SELECT file_url FROM materials WHERE id=:id"), {"id": first_mat_id})
+                mat_row = mat_result.fetchone()
+                if mat_row:
+                    src_url = mat_row[0]
+
             # Mark as processing
             await db.execute(sql_text("UPDATE edit_tasks SET status='processing', progress=5 WHERE id=:id"), {"id": task_id})
             await db.commit()
@@ -517,8 +534,23 @@ async def _simulate_edit(task_id: str, count: int, user_id: str):
                 await db.execute(sql_text("UPDATE edit_tasks SET progress=:p WHERE id=:id"), {"p": progress, "id": task_id})
                 await db.commit()
 
-            # Generate mock output URLs
-            output_urls = [f"/videos/{user_id}/output_{task_id[:8]}_{j+1:03d}.mp4" for j in range(count)]
+            # Create output files (copy first material as playable mock output)
+            out_dir = VIDEOS_DIR / user_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+            output_urls = []
+            for j in range(count):
+                fname = f"output_{task_id[:8]}_{j+1:03d}.mp4"
+                out_path = out_dir / fname
+                if src_url:
+                    src_path = UPLOAD_DIR / src_url.lstrip("/uploads/")
+                    if src_path.exists():
+                        shutil.copy(src_path, out_path)
+                    else:
+                        out_path.write_bytes(b"")
+                else:
+                    out_path.write_bytes(b"")
+                output_urls.append(f"/videos/{user_id}/{fname}")
+
             await db.execute(sql_text(
                 "UPDATE edit_tasks SET status='done', progress=100, output_urls=:urls WHERE id=:id"
             ), {"urls": ",".join(output_urls), "id": task_id})
