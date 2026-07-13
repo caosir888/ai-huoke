@@ -9,7 +9,14 @@ import json
 import asyncio
 import mimetypes
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# China Standard Time (UTC+8)
+CST = timezone(timedelta(hours=8))
+
+def now_cst() -> datetime:
+    """Return current datetime in China Standard Time."""
+    return datetime.now(CST)
 
 import httpx
 
@@ -108,12 +115,12 @@ async def login(req: LoginReq, db: AsyncSession = Depends(get_db)):
         await db.execute(text(
             "INSERT INTO users (id, phone, password_hash, industry, company_name, plan_type, is_active, created_at, updated_at) "
             "VALUES (:id, :phone, '', :industry, :company, 'free', 1, :now, :now)"
-        ), {"id": uid, "phone": req.phone, "industry": None, "company": None, "now": datetime.utcnow().isoformat()})
+        ), {"id": uid, "phone": req.phone, "industry": None, "company": None, "now": now_cst().isoformat()})
         # Init quota
         await db.execute(text(
             "INSERT INTO user_quotas (id, user_id, daily_video_count, monthly_video_count, account_limit, storage_bytes_used, storage_bytes_limit, updated_at) "
             "VALUES (:id, :uid, 3, 30, 1, 0, 1073741824, :now)"
-        ), {"id": str(uuid.uuid4()), "uid": uid, "now": datetime.utcnow().isoformat()})
+        ), {"id": str(uuid.uuid4()), "uid": uid, "now": now_cst().isoformat()})
         await db.commit()
 
     token = f"tok_{uid[:8]}_{uuid.uuid4().hex[:8]}"
@@ -337,7 +344,7 @@ async def list_copywriting(user: dict = Depends(get_token_user), db: AsyncSessio
     rows = result.fetchall()
     if not rows:
         # Return seed data for demo
-        now = datetime.utcnow().isoformat()
+        now = now_cst().isoformat()
         return [
             {"id": "demo1", "title": "重庆火锅 — 正宗牛油锅底", "body": "在重庆，没有一顿火锅解决不了的事！\n\n我们家的锅底，用了28味中草药和上等牛油，熬足8小时。看这翻滚的红汤，光闻着就流口水了吧？\n\n必点菜品：鲜毛肚，七上八下15秒，蘸上香油蒜泥，一口下去那个脆嫩……绝了！\n\n现在团购价只要128元，2-3人吃到撑。", "tags": "#重庆火锅 #火锅探店", "style": "口播", "source": "ai", "is_favorited": False, "created_at": now},
             {"id": "demo2", "title": "夏天必喝的爆款柠檬茶", "body": "30秒教会你做一杯好喝到爆的暴打柠檬茶！🍋\n\n新鲜香水柠檬切片，加冰暴打，把柠檬的香气打出来。倒入秘制茶底，一杯成本不到3块，卖15块！\n\n想了解更多饮品配方，关注我下期分享。", "tags": "#柠檬茶 #饮品教程", "style": "教程", "source": "ai", "is_favorited": True, "created_at": now},
@@ -348,7 +355,7 @@ async def list_copywriting(user: dict = Depends(get_token_user), db: AsyncSessio
 @app.post("/content/copywriting/generate")
 async def generate_copywriting(req: GenerateCopywritingReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
-    now = datetime.utcnow().isoformat()
+    now = now_cst().isoformat()
 
     # Try DeepSeek API first
     prompt = f"请为以下产品/服务生成{req.count}条短视频营销文案：\n关键词：{req.keywords}\n行业：{req.industry}\n风格：{req.style}"
@@ -444,7 +451,7 @@ async def upload_material(file: UploadFile = File(...), folder_id: str | None = 
 
     mid = str(uuid.uuid4())
     rel_url = f"/uploads/{user['id']}/{safe_name}"
-    now = datetime.utcnow().isoformat()
+    now = now_cst().isoformat()
 
     await db.execute(text(
         "INSERT INTO materials (id, user_id, folder_id, type, file_name, file_url, size, duration, tags, created_at) VALUES (:id, :uid, :fid, :type, :name, :url, :size, :dur, '{}', :now)"
@@ -473,7 +480,7 @@ async def list_folders(user: dict = Depends(get_token_user), db: AsyncSession = 
 async def create_folder(req: CreateFolderReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
     fid = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
+    now = now_cst().isoformat()
     await db.execute(text("INSERT INTO material_folders (id, user_id, name, parent_id, created_at) VALUES (:id, :uid, :name, :pid, :now)"), {"id": fid, "uid": user["id"], "name": req.name, "pid": req.parent_id, "now": now})
     await db.commit()
     return {"id": fid, "name": req.name, "parent_id": req.parent_id, "created_at": now}
@@ -482,7 +489,7 @@ async def create_folder(req: CreateFolderReq, user: dict = Depends(get_token_use
 async def create_edit_task(req: CreateEditTaskReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
     tid = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
+    now = now_cst().isoformat()
     await db.execute(text("INSERT INTO edit_tasks (id, user_id, material_ids, copywriting_id, template_id, params, status, progress, output_urls, created_at) VALUES (:id, :uid, :mids, :cid, :tid, :params, 'pending', 0, '{}', :now)"), {"id": tid, "uid": user["id"], "mids": ",".join(req.material_ids), "cid": req.copywriting_id, "tid": req.template_id, "params": req.model_dump_json(), "now": now})
     await db.commit()
     return {"id": tid, "material_ids": req.material_ids, "status": "pending", "progress": 0, "output_urls": [], "error_message": None, "created_at": now}
@@ -516,7 +523,7 @@ async def create_publish_task(req: CreatePublishTaskReq, user: dict = Depends(ge
     from sqlalchemy import text
     import json
     tid = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
+    now = now_cst().isoformat()
     await db.execute(text(
         "INSERT INTO publish_tasks (id, user_id, video_url, platform_account_id, title, schedule_type, schedule_time, status, metrics, created_at) VALUES (:id, :uid, :url, :aid, :title, :st, :sch, 'published', :metrics, :now)"
     ), {"id": tid, "uid": user["id"], "url": req.video_url, "aid": req.platform_account_id, "title": req.title, "st": req.schedule_type, "sch": req.schedule_time, "metrics": json.dumps({"plays": 0, "likes": 0, "comments": 0, "shares": 0}), "now": now})
@@ -540,7 +547,7 @@ async def list_accounts(user: dict = Depends(get_token_user), db: AsyncSession =
 async def bind_account(req: BindAccountReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
     aid = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
+    now = now_cst().isoformat()
     await db.execute(text(
         "INSERT INTO platform_accounts (id, user_id, platform, account_name, auth_token, auth_status, created_at) VALUES (:id, :uid, :platform, :name, :token, 'active', :now)"
     ), {"id": aid, "uid": user["id"], "platform": req.platform, "name": f"{req.platform}_account", "token": req.auth_token, "now": now})
