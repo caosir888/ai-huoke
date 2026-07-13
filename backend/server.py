@@ -5,11 +5,19 @@
 import os
 import sys
 import uuid
+import json
 import asyncio
 from datetime import datetime, timedelta
 
+import httpx
+
 # Patch config to use SQLite before importing app modules
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./aihuoke.db"
+
+# DeepSeek API config
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+DEEPSEEK_MODEL = "deepseek-chat"
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -127,9 +135,178 @@ class GenerateCopywritingReq(BaseModel):
     keywords: str
     style: str = "口播"
     count: int = 5
+    industry: str = "通用"
 
 class ParseLinkReq(BaseModel):
     url: str
+
+# ============ DeepSeek AI helpers ============
+
+COPYWRITING_SYSTEM_PROMPT = """你是一个短视频营销文案专家，专注于为中国商家撰写抖音/快手/小红书平台的爆款短视频文案。
+
+你的每条文案必须包含以下结构：
+1. 标题：10-20字，抓眼球，用数字/疑问/夸张手法
+2. 正文：150-300字，包含开场钩子(前3秒)→产品卖点→使用场景→优惠/行动号召
+3. 标签：3-5个#话题标签
+
+根据风格调整：
+- 口播型：口语化，像跟朋友聊天，多用感叹词
+- 展示型：视觉化描述+产品特写+使用效果，多用画面引导词
+- 教程型：步骤化讲解，数字编号，简单易懂
+- 促销型：强调优惠力度、限时限量、紧迫感
+- 剧情型：有开头冲突+反转+产品植入
+
+输出格式为JSON数组，每个元素包含 title, body, tags 三个字段。不要输出其他内容。"""
+
+async def call_deepseek(user_prompt: str, system_prompt: str = COPYWRITING_SYSTEM_PROMPT) -> list[dict] | None:
+    """调用DeepSeek API生成文案。失败返回None。"""
+    if not DEEPSEEK_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{DEEPSEEK_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": DEEPSEEK_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.8,
+                    "max_tokens": 4096,
+                },
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            # Parse JSON from response (strip markdown code fences if present)
+            content = content.strip()
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1]
+                if content.endswith("```"):
+                    content = content[:-3]
+            return json.loads(content)
+    except Exception:
+        return None
+
+STYLE_TEMPLATES = {
+    "口播": {
+        "openings": [
+            "兄弟们，今天给你们安利一个{keyword}，真的太绝了！",
+            "你敢信？这个{keyword}居然这么好吃/好用！",
+            "作为一个{industry}老司机，我强烈推荐{keyword}！",
+        ],
+        "body_template": "{opening}\n\n{points}\n\n{closing}",
+        "closings": [
+            "还在犹豫什么？点击下方链接，赶紧试试吧！",
+            "我身边的朋友都入手了，你还在等什么？",
+            "优惠名额有限，先到先得！",
+        ],
+    },
+    "教程": {
+        "openings": [
+            "30秒教会你{keyword}，小白也能学会！",
+            "今天分享一个{keyword}的神仙做法，学会了直接开店！",
+            "别再花冤枉钱了！{keyword}正确打开方式来啦~",
+        ],
+        "closings": [
+            "学会了吗？记得点赞收藏，关注我学更多干货！",
+            "还想学什么？评论区告诉我，下期安排！",
+        ],
+    },
+    "展示": {
+        "openings": [
+            "看这个{keyword}，这品质真的绝了！",
+            "{keyword}到底有多好？给你们近距离看看！",
+        ],
+        "closings": [
+            "想了解更多细节，私信我发你完整介绍~",
+        ],
+    },
+    "促销": {
+        "openings": [
+            "重磅福利！{keyword}现在只要XX元，错过等一年！",
+            "年底清仓！{keyword}打骨折，手慢无！",
+        ],
+        "closings": [
+            "库存不多，今天不买明天就恢复原价！点击下单！",
+        ],
+    },
+    "剧情": {
+        "openings": [
+            "老板说这个{keyword}卖不出去就要辞退我...",
+            "闺蜜说我做的{keyword}是黑暗料理？结果她吃了三碗...",
+        ],
+        "closings": [
+            "后续更精彩，关注我追更！",
+        ],
+    },
+}
+
+INDUSTRY_TAGS = {
+    "餐饮": ["美食探店", "美食推荐", "吃货", "必吃榜", "团购"],
+    "美业": ["皮肤管理", "美容护肤", "变美", "好物分享", "体验"],
+    "汽车": ["汽车", "买车", "汽车用品", "好车推荐"],
+    "零售": ["好物推荐", "开箱", "性价比", "必买清单"],
+    "家居": ["家居好物", "装修", "生活美学", "居家好物"],
+    "教育": ["学习", "知识分享", "干货", "考证", "技能"],
+    "医疗": ["健康科普", "养生", "健康", "体检"],
+}
+
+def generate_fallback(keywords: str, style: str, count: int, industry: str = "通用") -> list[dict]:
+    """无API key时使用模板生成可用文案（非占位符）。"""
+    import random
+    style_cfg = STYLE_TEMPLATES.get(style, STYLE_TEMPLATES["口播"])
+    tags_pool = INDUSTRY_TAGS.get(industry, ["好物推荐", "必买清单", "干货分享", "教程"])
+    results = []
+    for i in range(count):
+        opening = random.choice(style_cfg["openings"]).format(keyword=keywords, industry=industry)
+        closing = random.choice(style_cfg["closings"]).format(keyword=keywords, industry=industry)
+
+        # Build body based on industry
+        if industry == "餐饮":
+            points = (
+                f"第一，{keywords}的食材选用上等原料，绝不偷工减料。\n"
+                f"第二，制作工艺传承古法，每一道工序都严格把控。\n"
+                f"第三，价格实惠，性价比超高，人均消费不到50块。"
+            )
+            default_tags = ["美食探店", "美食推荐", "必吃榜"]
+        elif industry == "美业":
+            points = (
+                f"第一，{keywords}采用进口设备，安全无痛。\n"
+                f"第二，店长拥有10年经验，技术过硬。\n"
+                f"第三，现在体验价仅需99元，还送一次免费补水面膜。"
+            )
+            default_tags = ["皮肤管理", "变美日记", "体验分享"]
+        elif industry == "零售":
+            points = (
+                f"第一，{keywords}一手货源，品质有保障。\n"
+                f"第二，支持一件代发，零库存零风险。\n"
+                f"第三，7天无理由退换，售后无忧。"
+            )
+            default_tags = ["好物推荐", "一件代发", "源头好货"]
+        else:
+            points = (
+                f"第一，{keywords}质量过硬，用过的都说好。\n"
+                f"第二，价格实惠，同样品质只要一半的价格。\n"
+                f"第三，服务到位，售后无忧，值得信赖。"
+            )
+            default_tags = tags_pool[:3]
+
+        title = f"{keywords} — {random.choice(['真的绝了', '太划算了', '必入推荐', '实测分享', '种草推荐'])}"
+        body = style_cfg["body_template"].format(
+            opening=opening, points=points, closing=closing
+        )
+        tags = " ".join(f"#{t}" for t in random.sample(default_tags + tags_pool, min(5, len(default_tags) + len(tags_pool))))
+
+        results.append({"title": title, "body": body, "tags": tags})
+
+    return results
 
 class CreateFolderReq(BaseModel):
     name: str
@@ -164,19 +341,72 @@ async def list_copywriting(user: dict = Depends(get_token_user), db: AsyncSessio
 async def generate_copywriting(req: GenerateCopywritingReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
     now = datetime.utcnow().isoformat()
+
+    # Try DeepSeek API first
+    prompt = f"请为以下产品/服务生成{req.count}条短视频营销文案：\n关键词：{req.keywords}\n行业：{req.industry}\n风格：{req.style}"
+    items = await call_deepseek(prompt)
+
+    if items is None:
+        # DeepSeek unavailable, use template fallback
+        items = generate_fallback(req.keywords, req.style, req.count, req.industry)
+
     generated = []
-    for i in range(req.count):
+    for i, item in enumerate(items[: req.count]):
         cid = str(uuid.uuid4())
+        title = item.get("title", f"{req.keywords}文案{i+1}")
+        body = item.get("body", "")
+        tags = item.get("tags", f"#{req.keywords}")
+        # DeepSeek may return tags as a JSON array, normalize to string
+        if isinstance(tags, list):
+            tags = " ".join(f"#{t.strip('#')}" for t in tags)
         await db.execute(text(
             "INSERT INTO copywriting_templates (id, user_id, title, body, tags, style, source, is_favorited, created_at) VALUES (:id, :uid, :title, :body, :tags, :style, 'ai', 0, :now)"
-        ), {"id": cid, "uid": user["id"], "title": f"{req.keywords}文案{i+1}", "body": f"关于{req.keywords}的精彩文案内容...（接入DeepSeek后生成真实内容）", "tags": f"#{req.keywords}", "style": req.style, "now": now})
-        generated.append({"id": cid, "title": f"{req.keywords}文案{i+1}", "body": "...", "tags": f"#{req.keywords}", "style": req.style, "source": "ai", "is_favorited": False, "created_at": now})
+        ), {"id": cid, "uid": user["id"], "title": title, "body": body, "tags": tags, "style": req.style, "now": now})
+        generated.append({"id": cid, "title": title, "body": body, "tags": tags, "style": req.style, "source": "ai", "is_favorited": False, "created_at": now})
+
     await db.commit()
     return generated
 
 @app.post("/content/copywriting/parse-link")
 async def parse_link(req: ParseLinkReq, user: dict = Depends(get_token_user)):
-    return {"title_formula": "痛点+解决方案+优惠", "body_structure": "开场3秒抓眼球→展示产品→价格锚点→限时优惠→引导行动", "tag_strategy": "#行业词 #场景词", "key_elements": "1.夸张开场 2.价格对比 3.紧迫感 4.行动指令"}
+    # Try DeepSeek
+    prompt = f"请分析这个短视频链接的内容结构，拆解出：标题公式、正文结构、标签策略、关键元素。链接：{req.url}"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                f"{DEEPSEEK_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": DEEPSEEK_MODEL,
+                    "messages": [
+                        {"role": "system", "content": "你是一个短视频内容分析专家。分析爆款视频的结构，拆解其公式。返回JSON格式：{\"title_formula\":\"...\", \"body_structure\":\"...\", \"tag_strategy\":\"...\", \"key_elements\":\"...\"}，不要输出其他内容。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.5,
+                    "max_tokens": 1024,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"].strip()
+                if content.startswith("```"):
+                    content = content.split("\n", 1)[1]
+                    if content.endswith("```"):
+                        content = content[:-3]
+                return json.loads(content)
+    except Exception:
+        pass
+
+    # Fallback
+    return {
+        "title_formula": "痛点+解决方案+优惠",
+        "body_structure": "开场3秒抓眼球→展示产品→价格锚点→限时优惠→引导行动",
+        "tag_strategy": "#行业词 #场景词 #热搜词",
+        "key_elements": "1.夸张开场 2.价格对比 3.紧迫感 4.行动指令"
+    }
 
 @app.post("/content/materials/upload")
 async def upload_material(file: UploadFile = File(...), folder_id: str | None = Form(None), user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
