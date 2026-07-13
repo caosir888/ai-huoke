@@ -191,11 +191,16 @@ export default function EditTaskWizard({ open, onClose, onCreated }: Props) {
               </Col>
               <Col span={12}>
                 <label>AI配音</label>
-                <Radio.Group value={voice} onChange={e => setVoice(e.target.value)}>
-                  <Radio.Button value="none">无配音</Radio.Button>
-                  <Radio.Button value="female">女声</Radio.Button>
-                  <Radio.Button value="male">男声</Radio.Button>
-                </Radio.Group>
+                <Select value={voice} onChange={setVoice} style={{ width: '100%' }}
+                  options={[
+                    { label: '无配音', value: 'none' },
+                    { label: '温暖女声 — 适合带货种草', value: 'female_warm' },
+                    { label: '温柔女声 — 适合生活方式', value: 'female_gentle' },
+                    { label: '活泼女声 — 适合潮流娱乐', value: 'female_lively' },
+                    { label: '专业男声 — 适合知识讲解', value: 'male_professional' },
+                    { label: '阳光男声 — 适合日常Vlog', value: 'male_sunshine' },
+                    { label: '激情男声 — 适合运动促销', value: 'male_passion' },
+                  ]} />
               </Col>
               <Col span={12}>
                 <label>字幕样式</label>

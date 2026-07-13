@@ -504,51 +504,70 @@ async def create_edit_task(req: CreateEditTaskReq, user: dict = Depends(get_toke
     return {"id": tid, "material_ids": req.material_ids, "status": "pending", "progress": 0, "output_urls": [], "error_message": None, "created_at": now}
 
 async def _simulate_edit(task_id: str, count: int, user_id: str):
-    """Simulate video editing: pending → processing → done with playable output."""
+    """Real FFmpeg video mixing using mixer.py."""
     import random
-    import shutil
     from sqlalchemy import text as sql_text
 
     async with async_session() as db:
         try:
-            # Fetch material_ids for this task
+            # Fetch all material file paths
             result = await db.execute(sql_text("SELECT material_ids FROM edit_tasks WHERE id=:id"), {"id": task_id})
             row = result.fetchone()
-            src_url = None
+            input_files = []
             if row and row[0]:
-                first_mat_id = row[0].split(",")[0]
-                mat_result = await db.execute(sql_text("SELECT file_url FROM materials WHERE id=:id"), {"id": first_mat_id})
-                mat_row = mat_result.fetchone()
-                if mat_row:
-                    src_url = mat_row[0]
+                mat_ids = row[0].split(",")
+                for mid in mat_ids:
+                    mat_result = await db.execute(sql_text("SELECT file_url FROM materials WHERE id=:id"), {"id": mid})
+                    mat_row = mat_result.fetchone()
+                    if mat_row:
+                        src_path = UPLOAD_DIR / mat_row[0].lstrip("/uploads/")
+                        if src_path.exists():
+                            input_files.append(str(src_path))
 
             # Mark as processing
-            await db.execute(sql_text("UPDATE edit_tasks SET status='processing', progress=5 WHERE id=:id"), {"id": task_id})
+            await db.execute(sql_text("UPDATE edit_tasks SET status='processing', progress=10 WHERE id=:id"), {"id": task_id})
             await db.commit()
 
-            # Simulate incremental progress over ~10 seconds
-            steps = random.randint(5, 10)
-            for i in range(1, steps + 1):
-                await asyncio.sleep(random.uniform(0.8, 2.0))
-                progress = min(5 + int(90 * i / steps), 99)
-                await db.execute(sql_text("UPDATE edit_tasks SET progress=:p WHERE id=:id"), {"p": progress, "id": task_id})
-                await db.commit()
+            # Fetch copywriting + voice + duration params
+            copywriting_text = ""
+            voice = "none"
+            total_duration = 30  # default 30s
+            task_result = await db.execute(sql_text("SELECT copywriting_id, params FROM edit_tasks WHERE id=:id"), {"id": task_id})
+            task_row = task_result.fetchone()
+            if task_row:
+                if task_row[0]:
+                    cw_content = await db.execute(sql_text("SELECT body FROM copywriting_templates WHERE id=:id"), {"id": task_row[0]})
+                    cw_content_row = cw_content.fetchone()
+                    if cw_content_row and cw_content_row[0]:
+                        copywriting_text = cw_content_row[0][:300]
+                if task_row[1]:
+                    try:
+                        params = json.loads(task_row[1])
+                        voice = params.get("voice", "none")
+                        total_duration = params.get("duration", 30)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
-            # Create output files (copy first material as playable mock output)
+            # === Real FFmpeg mixing (run in thread to not block event loop) ===
             out_dir = VIDEOS_DIR / user_id
             out_dir.mkdir(parents=True, exist_ok=True)
+
+            import mixer
+            output_paths = await asyncio.to_thread(
+                mixer.mix_videos,
+                input_files=input_files,
+                output_dir=str(out_dir),
+                count=count,
+                total_duration=total_duration,
+                subtitle=copywriting_text,
+                voice=voice,
+            )
+            # =========================
+
+            # Build relative URLs from output paths
             output_urls = []
-            for j in range(count):
-                fname = f"output_{task_id[:8]}_{j+1:03d}.mp4"
-                out_path = out_dir / fname
-                if src_url:
-                    src_path = UPLOAD_DIR / src_url.lstrip("/uploads/")
-                    if src_path.exists():
-                        shutil.copy(src_path, out_path)
-                    else:
-                        out_path.write_bytes(b"")
-                else:
-                    out_path.write_bytes(b"")
+            for op in output_paths:
+                fname = Path(op).name
                 output_urls.append(f"/videos/{user_id}/{fname}")
 
             await db.execute(sql_text(

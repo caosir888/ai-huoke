@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Card, Table, Tag, Progress, Button } from 'antd';
+import { Card, Table, Tag, Progress, Button, Dropdown } from 'antd';
+import type { MenuProps } from 'antd';
 import { EyeOutlined, DownloadOutlined, PlusOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { listEditTasks } from '../api/content';
@@ -62,25 +63,48 @@ export default function EditTaskPanel() {
       render: (urls: string[]) => urls.length ? `${urls.length}条` : '-' },
     { title: '创建时间', dataIndex: 'created_at', key: 'time', width: 160,
       render: (d: string) => new Date(d).toLocaleString() },
-    { title: '操作', key: 'action', width: 140, render: (_, record) => (
-      <div style={{ display: 'flex', gap: 4 }}>
-        {record.status === 'done' && record.output_urls.length > 0 && (
-          <>
-            <Button size="small" icon={<EyeOutlined />}
-              onClick={() => { setPreviewUrl(record.output_urls[0]); setPreviewOpen(true); }}>
-              预览
-            </Button>
-            <Button size="small" icon={<DownloadOutlined />}
-              onClick={() => { const a = document.createElement('a'); const u = record.output_urls[0]; a.href = u.startsWith('http') ? u : ('http://localhost:8000' + u); a.download = 'video.mp4'; a.click(); }}>
-              下载
-            </Button>
-          </>
-        )}
-        {record.status === 'failed' && (
-          <Button size="small" onClick={() => alert(record.error_message)}>查看原因</Button>
-        )}
-      </div>
-    )},
+    { title: '操作', key: 'action', width: 220, render: (_, record) => {
+      const urls = record.output_urls || [];
+      const resolveUrl = (u: string) => u.startsWith('http') ? u : 'http://localhost:8000' + u;
+
+      if (record.status !== 'done' || urls.length === 0) {
+        if (record.status === 'failed') {
+          return <Button size="small" onClick={() => alert(record.error_message)}>查看原因</Button>;
+        }
+        return null;
+      }
+
+      // Build dropdown menu items for all outputs
+      const menuItems: MenuProps['items'] = urls.map((u, i) => ({
+        key: String(i),
+        label: `视频 #${i + 1}`,
+        icon: <EyeOutlined />,
+        onClick: () => { setPreviewUrl(u); setPreviewOpen(true); },
+      }));
+
+      // Download handler for all
+      const downloadAll = () => {
+        urls.forEach((u, i) => {
+          setTimeout(() => {
+            const a = document.createElement('a');
+            a.href = resolveUrl(u);
+            a.download = `output_${String(i + 1).padStart(3, '0')}.mp4`;
+            a.click();
+          }, i * 500);
+        });
+      };
+
+      return (
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+          <Dropdown menu={{ items: menuItems }} trigger={['click']}>
+            <Button size="small" icon={<EyeOutlined />}>预览 ({urls.length})</Button>
+          </Dropdown>
+          <Button size="small" icon={<DownloadOutlined />} onClick={downloadAll}>
+            下载全部
+          </Button>
+        </div>
+      );
+    }},
   ];
 
   return (
