@@ -1,6 +1,13 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useMemo } from 'react';
 import { Modal, Button, Space, message, Spin } from 'antd';
 import { DownloadOutlined } from '@ant-design/icons';
+
+const BACKEND = 'http://localhost:8000';
+
+function resolveUrl(url: string) {
+  if (url.startsWith('http')) return url;
+  return BACKEND + url;
+}
 
 interface Props {
   url: string | null;
@@ -11,11 +18,12 @@ interface Props {
 export default function VideoPreview({ url, visible, onClose }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [loading, setLoading] = useState(true);
+  const resolvedUrl = useMemo(() => url ? resolveUrl(url) : null, [url]);
 
   const handleDownload = () => {
     if (url) {
       const a = document.createElement('a');
-      a.href = url;
+      a.href = resolveUrl(url);
       a.download = 'video.mp4';
       a.click();
       message.success('开始下载');
@@ -41,10 +49,10 @@ export default function VideoPreview({ url, visible, onClose }: Props) {
           <Spin tip="加载视频..." />
         </div>
       )}
-      {url ? (
+      {resolvedUrl ? (
         <video
           ref={videoRef}
-          src={url}
+          src={resolvedUrl}
           controls
           autoPlay
           style={{ width: '100%', maxHeight: '70vh', borderRadius: 8, display: loading ? 'none' : 'block' }}

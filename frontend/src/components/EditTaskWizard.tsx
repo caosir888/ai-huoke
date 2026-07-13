@@ -117,7 +117,7 @@ export default function EditTaskWizard({ open, onClose, onCreated }: Props) {
                       );
                     }}
                   >
-                    <video src={m.file_url} style={{ width: '100%', height: 100, objectFit: 'cover', borderRadius: 4 }} />
+                    <video src={m.file_url.startsWith('http') ? m.file_url : ('http://localhost:8000' + m.file_url)} style={{ width: '100%', height: 100, objectFit: 'cover', borderRadius: 4 }} />
                     <div style={{ marginTop: 4, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       {m.file_name}
                     </div>

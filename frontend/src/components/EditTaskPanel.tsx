@@ -71,7 +71,7 @@ export default function EditTaskPanel() {
               预览
             </Button>
             <Button size="small" icon={<DownloadOutlined />}
-              onClick={() => { const a = document.createElement('a'); a.href = record.output_urls[0]; a.download = 'video.mp4'; a.click(); }}>
+              onClick={() => { const a = document.createElement('a'); const u = record.output_urls[0]; a.href = u.startsWith('http') ? u : ('http://localhost:8000' + u); a.download = 'video.mp4'; a.click(); }}>
               下载
             </Button>
           </>
