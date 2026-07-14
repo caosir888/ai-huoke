@@ -67,7 +67,6 @@ async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit
 security = HTTPBearer()
 
 # ============ In-memory stores ============
-codes: dict[str, str] = {}
 users: dict[str, dict] = {}
 
 # ============ DB Helpers ============
@@ -101,13 +100,37 @@ class UpdateProfileReq(BaseModel):
 
 @app.post("/auth/send-code")
 async def send_code(req: SendCodeReq):
-    codes[req.phone] = "8888"
-    return {"message": "验证码已发送", "debug_code": "8888"}
+    """Send verification code via SMS (or debug mode). Includes rate limiting."""
+    import sms
+
+    # Rate limit: 60s cooldown per phone
+    if not sms.can_send(req.phone):
+        wait = sms.seconds_until_next(req.phone)
+        raise HTTPException(status_code=429, detail=f"请 {wait} 秒后再试")
+
+    # Generate random 6-digit code
+    code = sms.generate_code()
+    sms.store_code(req.phone, code)
+
+    # Send via configured provider (debug by default)
+    result = sms.send_sms(req.phone, code)
+    if not result["ok"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "短信发送失败"))
+
+    resp = {"message": "验证码已发送"}
+    if result.get("debug_code"):
+        resp["debug_code"] = result["debug_code"]
+    return resp
+
 
 @app.post("/auth/login")
 async def login(req: LoginReq, db: AsyncSession = Depends(get_db)):
-    if codes.get(req.phone) != req.code:
-        raise HTTPException(status_code=400, detail="验证码错误")
+    import sms
+
+    # Verify code
+    valid, err_msg = sms.verify_code(req.phone, req.code)
+    if not valid:
+        raise HTTPException(status_code=400, detail=err_msg)
 
     # Check existing user in SQLite
     from sqlalchemy import text
@@ -133,7 +156,6 @@ async def login(req: LoginReq, db: AsyncSession = Depends(get_db)):
 
     token = f"tok_{uid[:8]}_{uuid.uuid4().hex[:8]}"
     users[token] = user_data
-    del codes[req.phone]
     return {"access_token": token, "token_type": "bearer"}
 
 @app.get("/auth/me")
