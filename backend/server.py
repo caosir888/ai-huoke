@@ -1095,6 +1095,32 @@ async def quota_usage(user: dict = Depends(get_token_user), db: AsyncSession = D
         "storage": {"used": storage_used, "used_gb": round(storage_used / (1024**3), 2), "limit": row[4], "limit_gb": round(row[4] / (1024**3), 1)},
     }
 
+# ============ Admin ============
+
+@app.get("/admin/users")
+async def list_all_users(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    """List all registered users with their quota info (admin panel)."""
+    from sqlalchemy import text
+    result = await db.execute(text("""
+        SELECT u.id, u.phone, u.industry, u.company_name, u.plan_type,
+               u.is_active, u.created_at,
+               q.daily_video_count, q.monthly_video_count, q.account_limit,
+               q.storage_bytes_used, q.storage_bytes_limit
+        FROM users u LEFT JOIN user_quotas q ON u.id = q.user_id
+        ORDER BY u.created_at DESC
+    """))
+    rows = result.fetchall()
+    return [{
+        "id": r[0], "phone": r[1], "industry": r[2], "company_name": r[3],
+        "plan_type": r[4], "is_active": r[5], "created_at": r[6],
+        "quota": {
+            "daily_limit": r[7] or 3, "monthly_limit": r[8] or 30,
+            "account_limit": r[9] or 1,
+            "storage_used": r[10] or 0, "storage_limit": r[11] or 1073741824,
+        }
+    } for r in rows]
+
+
 # ============ Feedback ============
 
 class FeedbackReq(BaseModel):
