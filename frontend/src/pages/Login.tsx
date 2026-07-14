@@ -23,14 +23,15 @@ export default function Login() {
     }
     setSending(true);
     try {
-      await sendCode(phone);
-      message.success('验证码已发送');
+      const { data } = await sendCode(phone);
+      const msg = data.debug_code ? `验证码已发送（调试：${data.debug_code}）` : '验证码已发送';
+      message.success(msg);
       setCountdown(60);
       const timer = setInterval(() => {
         setCountdown((c) => { if (c <= 1) { clearInterval(timer); return 0; } return c - 1; });
       }, 1000);
-    } catch {
-      message.error('发送失败');
+    } catch (err: any) {
+      message.error(err.friendlyMessage || '发送失败');
     }
     setSending(false);
   };
@@ -43,8 +44,8 @@ export default function Login() {
       await fetchUser();
       message.success('登录成功');
       navigate('/');
-    } catch {
-      message.error('登录失败，请检查验证码');
+    } catch (err: any) {
+      message.error(err.friendlyMessage || '登录失败，请检查验证码');
     }
     setLoading(false);
   };
