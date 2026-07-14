@@ -16,5 +16,3 @@ export const reschedule = (taskId: string, scheduleTime: string) =>
 
 export const cancelPublishTask = (taskId: string) =>
   api.post(`/publish/cancel/${taskId}`);
-
-export const getMetrics = (taskId: string) => api.get(`/publish/metrics/${taskId}`);

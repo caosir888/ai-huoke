@@ -36,5 +36,3 @@ export const createEditTask = (data: {
 }) => api.post('/content/edit-tasks', data);
 
 export const listEditTasks = () => api.get('/content/edit-tasks');
-
-export const getEditTask = (id: string) => api.get(`/content/edit-tasks/${id}`);
