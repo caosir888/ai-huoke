@@ -36,7 +36,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
 app = FastAPI(title="AI获客", version="1.0.0")
@@ -1121,6 +1121,489 @@ async def list_all_users(user: dict = Depends(get_token_user), db: AsyncSession 
     } for r in rows]
 
 
+# ============ Lead Forms ============
+
+class CreateFormReq(BaseModel):
+    title: str
+    description: str = ""
+    fields: list[str] = ["name", "phone", "company"]
+    video_url: str | None = None
+    is_active: bool = True
+
+class UpdateFormReq(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    fields: list[str] | None = None
+    video_url: str | None = None
+    is_active: bool | None = None
+
+
+def _gen_share_code() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+@app.post("/leads/forms")
+async def create_form(req: CreateFormReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    fid = str(uuid.uuid4())
+    share_code = _gen_share_code()
+    now = now_cst().isoformat()
+    await db.execute(text(
+        "INSERT INTO lead_forms (id, user_id, title, description, fields, video_url, is_active, share_code, created_at) "
+        "VALUES (:id, :uid, :title, :desc, :fields, :video, :active, :code, :now)"
+    ), {"id": fid, "uid": user["id"], "title": req.title, "desc": req.description,
+        "fields": json.dumps(req.fields), "video": req.video_url,
+        "active": 1 if req.is_active else 0, "code": share_code, "now": now})
+    await db.commit()
+    return {"id": fid, "share_code": share_code, "title": req.title}
+
+
+@app.get("/leads/forms")
+async def list_forms(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(text(
+        "SELECT f.*, (SELECT COUNT(*) FROM leads WHERE form_id = f.id) as lead_count "
+        "FROM lead_forms f WHERE f.user_id = :uid ORDER BY f.created_at DESC"
+    ), {"uid": user["id"]})
+    rows = result.fetchall()
+    return [{
+        "id": r[0], "user_id": r[1], "title": r[2], "description": r[3],
+        "fields": json.loads(r[4]) if r[4] else [],
+        "video_url": r[5], "is_active": r[6], "share_code": r[7],
+        "created_at": r[8], "lead_count": r[9],
+    } for r in rows]
+
+
+@app.put("/leads/forms/{form_id}")
+async def update_form(form_id: str, req: UpdateFormReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    sets = []
+    params = {"fid": form_id, "uid": user["id"]}
+    if req.title is not None:
+        sets.append("title = :title")
+        params["title"] = req.title
+    if req.description is not None:
+        sets.append("description = :desc")
+        params["desc"] = req.description
+    if req.fields is not None:
+        sets.append("fields = :fields")
+        params["fields"] = json.dumps(req.fields)
+    if req.video_url is not None:
+        sets.append("video_url = :video")
+        params["video"] = req.video_url
+    if req.is_active is not None:
+        sets.append("is_active = :active")
+        params["active"] = 1 if req.is_active else 0
+    if not sets:
+        raise HTTPException(status_code=400, detail="没有可更新的字段")
+    await db.execute(text(f"UPDATE lead_forms SET {', '.join(sets)} WHERE id = :fid AND user_id = :uid"), params)
+    await db.commit()
+    return {"ok": True}
+
+
+@app.delete("/leads/forms/{form_id}")
+async def delete_form(form_id: str, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    await db.execute(text("DELETE FROM lead_forms WHERE id = :fid AND user_id = :uid"), {"fid": form_id, "uid": user["id"]})
+    await db.execute(text("DELETE FROM leads WHERE form_id = :fid"), {"fid": form_id})
+    await db.commit()
+    return {"ok": True}
+
+
+# ============ Public Form (no auth) ============
+
+@app.get("/public/form/{share_code}")
+async def get_public_form(share_code: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(text(
+        "SELECT id, title, description, fields, video_url, is_active FROM lead_forms WHERE share_code = :code"
+    ), {"code": share_code})
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="表单不存在")
+    if not row[5]:
+        raise HTTPException(status_code=404, detail="表单已关闭")
+    return {
+        "id": row[0], "title": row[1], "description": row[2],
+        "fields": json.loads(row[3]) if row[3] else [],
+        "video_url": row[4],
+    }
+
+
+class SubmitLeadReq(BaseModel):
+    name: str = ""
+    phone: str = ""
+    company: str = ""
+    message: str = ""
+
+
+@app.post("/public/form/{share_code}/submit")
+async def submit_lead(share_code: str, req: SubmitLeadReq, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(text(
+        "SELECT id, user_id, video_url FROM lead_forms WHERE share_code = :code AND is_active = 1"
+    ), {"code": share_code})
+    form = result.fetchone()
+    if not form:
+        raise HTTPException(status_code=404, detail="表单不存在或已关闭")
+
+    lid = str(uuid.uuid4())
+    now = now_cst().isoformat()
+    await db.execute(text(
+        "INSERT INTO leads (id, user_id, form_id, name, phone, company, message, source, source_video_url, status, notes, created_at, updated_at) "
+        "VALUES (:id, :uid, :fid, :name, :phone, :company, :msg, 'form', :video, 'new', '', :now, :now)"
+    ), {"id": lid, "uid": form[1], "fid": form[0], "name": req.name, "phone": req.phone,
+        "company": req.company, "msg": req.message, "video": form[2], "now": now})
+    await db.commit()
+    return {"ok": True, "message": "提交成功，我们会尽快与您联系！"}
+
+
+# ============ Lead Management ============
+
+class UpdateLeadReq(BaseModel):
+    name: str | None = None
+    phone: str | None = None
+    company: str | None = None
+    message: str | None = None
+    status: str | None = None
+    notes: str | None = None
+
+
+@app.get("/leads")
+async def list_leads(
+    status: str | None = None,
+    source: str | None = None,
+    form_id: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+    user: dict = Depends(get_token_user),
+    db: AsyncSession = Depends(get_db),
+):
+    where = ["l.user_id = :uid"]
+    params = {"uid": user["id"]}
+    if status:
+        where.append("l.status = :status")
+        params["status"] = status
+    if source:
+        where.append("l.source = :source")
+        params["source"] = source
+    if form_id:
+        where.append("l.form_id = :fid")
+        params["fid"] = form_id
+
+    where_clause = " AND ".join(where)
+    # Count
+    count_r = await db.execute(text(f"SELECT COUNT(*) FROM leads l WHERE {where_clause}"), params)
+    total = count_r.fetchone()[0]
+
+    offset = (page - 1) * page_size
+    result = await db.execute(text(
+        f"SELECT l.*, f.title as form_title FROM leads l "
+        f"LEFT JOIN lead_forms f ON l.form_id = f.id "
+        f"WHERE {where_clause} ORDER BY l.created_at DESC LIMIT :limit OFFSET :offset"
+    ), {**params, "limit": page_size, "offset": offset})
+    rows = result.fetchall()
+    items = [{
+        "id": r[0], "user_id": r[1], "form_id": r[2], "name": r[3],
+        "phone": r[4], "company": r[5], "message": r[6], "source": r[7],
+        "source_video_url": r[8], "status": r[9], "notes": r[10],
+        "created_at": r[11], "updated_at": r[12], "form_title": r[13],
+    } for r in rows]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@app.get("/leads/stats")
+async def lead_stats(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    today = now_cst().strftime("%Y-%m-%d")
+    params = {"uid": user["id"], "today": today + "%"}
+
+    total_r = await db.execute(text("SELECT COUNT(*) FROM leads WHERE user_id = :uid"), {"uid": user["id"]})
+    total = total_r.fetchone()[0]
+
+    today_r = await db.execute(text(
+        "SELECT COUNT(*) FROM leads WHERE user_id = :uid AND created_at >= :today"
+    ), params)
+    today_count = today_r.fetchone()[0]
+
+    status_r = await db.execute(text(
+        "SELECT status, COUNT(*) FROM leads WHERE user_id = :uid GROUP BY status"
+    ), {"uid": user["id"]})
+    by_status = {row[0]: row[1] for row in status_r.fetchall()}
+
+    converted = by_status.get("converted", 0)
+    conversion_rate = round(converted / total * 100, 1) if total > 0 else 0
+
+    source_r = await db.execute(text(
+        "SELECT source, COUNT(*) FROM leads WHERE user_id = :uid GROUP BY source"
+    ), {"uid": user["id"]})
+    by_source = {row[0]: row[1] for row in source_r.fetchall()}
+
+    return {
+        "total": total,
+        "today_new": today_count,
+        "by_status": by_status,
+        "conversion_rate": conversion_rate,
+        "contacted": by_status.get("contacted", 0),
+        "by_source": by_source,
+    }
+
+
+@app.get("/leads/{lead_id}")
+async def get_lead(lead_id: str, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(text(
+        "SELECT l.*, f.title as form_title FROM leads l "
+        "LEFT JOIN lead_forms f ON l.form_id = f.id "
+        "WHERE l.id = :lid AND l.user_id = :uid"
+    ), {"lid": lead_id, "uid": user["id"]})
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="线索不存在")
+    return {
+        "id": row[0], "user_id": row[1], "form_id": row[2], "name": row[3],
+        "phone": row[4], "company": row[5], "message": row[6], "source": row[7],
+        "source_video_url": row[8], "status": row[9], "notes": row[10],
+        "created_at": row[11], "updated_at": row[12], "form_title": row[13],
+    }
+
+
+@app.put("/leads/{lead_id}")
+async def update_lead(lead_id: str, req: UpdateLeadReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    sets = ["updated_at = :now"]
+    params = {"lid": lead_id, "uid": user["id"], "now": now_cst().isoformat()}
+    if req.name is not None:
+        sets.append("name = :name")
+        params["name"] = req.name
+    if req.phone is not None:
+        sets.append("phone = :phone")
+        params["phone"] = req.phone
+    if req.company is not None:
+        sets.append("company = :company")
+        params["company"] = req.company
+    if req.message is not None:
+        sets.append("message = :msg")
+        params["msg"] = req.message
+    if req.status is not None:
+        valid_statuses = {"new", "contacted", "qualified", "converted", "lost"}
+        if req.status not in valid_statuses:
+            raise HTTPException(status_code=400, detail=f"无效状态，可选: {', '.join(valid_statuses)}")
+        sets.append("status = :status")
+        params["status"] = req.status
+    if req.notes is not None:
+        sets.append("notes = :notes")
+        params["notes"] = req.notes
+    result = await db.execute(text(
+        f"UPDATE leads SET {', '.join(sets)} WHERE id = :lid AND user_id = :uid"
+    ), params)
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="线索不存在")
+    return {"ok": True}
+
+
+@app.delete("/leads/{lead_id}")
+async def delete_lead(lead_id: str, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    await db.execute(text("DELETE FROM leads WHERE id = :lid AND user_id = :uid"), {"lid": lead_id, "uid": user["id"]})
+    await db.commit()
+    return {"ok": True}
+
+
+# ============ Outreach / DM Templates ============
+
+class CreateDMTemplateReq(BaseModel):
+    name: str
+    content: str
+    image_url: str | None = None
+    platform: str = "douyin"
+
+class UpdateDMTemplateReq(BaseModel):
+    name: str | None = None
+    content: str | None = None
+    image_url: str | None = None
+
+
+@app.post("/outreach/templates")
+async def create_dm_template(req: CreateDMTemplateReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    tid = str(uuid.uuid4())
+    now = now_cst().isoformat()
+    await db.execute(text(
+        "INSERT INTO dm_templates (id, user_id, name, content, image_url, platform, usage_count, created_at) "
+        "VALUES (:id, :uid, :name, :content, :img, :plat, 0, :now)"
+    ), {"id": tid, "uid": user["id"], "name": req.name, "content": req.content,
+        "img": req.image_url, "plat": req.platform, "now": now})
+    await db.commit()
+    return {"id": tid, "name": req.name}
+
+
+@app.get("/outreach/templates")
+async def list_dm_templates(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(text(
+        "SELECT * FROM dm_templates WHERE user_id = :uid ORDER BY created_at DESC"
+    ), {"uid": user["id"]})
+    rows = result.fetchall()
+    return [{
+        "id": r[0], "user_id": r[1], "name": r[2], "content": r[3],
+        "image_url": r[4], "platform": r[5], "usage_count": r[6], "created_at": r[7],
+    } for r in rows]
+
+
+@app.put("/outreach/templates/{template_id}")
+async def update_dm_template(template_id: str, req: UpdateDMTemplateReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    sets = []
+    params = {"tid": template_id, "uid": user["id"]}
+    if req.name is not None:
+        sets.append("name = :name")
+        params["name"] = req.name
+    if req.content is not None:
+        sets.append("content = :content")
+        params["content"] = req.content
+    if req.image_url is not None:
+        sets.append("image_url = :img")
+        params["img"] = req.image_url
+    if not sets:
+        raise HTTPException(status_code=400, detail="没有可更新的字段")
+    await db.execute(text(f"UPDATE dm_templates SET {', '.join(sets)} WHERE id = :tid AND user_id = :uid"), params)
+    await db.commit()
+    return {"ok": True}
+
+
+@app.delete("/outreach/templates/{template_id}")
+async def delete_dm_template(template_id: str, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    await db.execute(text("DELETE FROM dm_templates WHERE id = :tid AND user_id = :uid"), {"tid": template_id, "uid": user["id"]})
+    await db.commit()
+    return {"ok": True}
+
+
+# ============ Outreach Tasks ============
+
+class CreateOutreachReq(BaseModel):
+    lead_ids: list[str]
+    template_id: str
+    platform: str = "douyin"
+
+
+@app.post("/outreach/send")
+async def create_outreach_tasks(req: CreateOutreachReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    # Verify template exists
+    tpl = await db.execute(text(
+        "SELECT id, content, image_url FROM dm_templates WHERE id = :tid AND user_id = :uid"
+    ), {"tid": req.template_id, "uid": user["id"]})
+    template = tpl.fetchone()
+    if not template:
+        raise HTTPException(status_code=404, detail="话术模板不存在")
+
+    now = now_cst().isoformat()
+    created = []
+    for lead_id in req.lead_ids:
+        # Get lead info
+        lead = await db.execute(text(
+            "SELECT id, name FROM leads WHERE id = :lid AND user_id = :uid"
+        ), {"lid": lead_id, "uid": user["id"]})
+        if not lead.fetchone():
+            continue
+        tid = str(uuid.uuid4())
+        await db.execute(text(
+            "INSERT INTO outreach_tasks (id, user_id, lead_id, template_id, platform, target_user_id, status, result_message, sent_at, created_at) "
+            "VALUES (:id, :uid, :lid, :tid, :plat, '', 'pending', '', NULL, :now)"
+        ), {"id": tid, "uid": user["id"], "lid": lead_id, "tid": req.template_id,
+            "plat": req.platform, "now": now})
+        created.append({"task_id": tid, "lead_id": lead_id})
+
+    # Increment template usage count
+    await db.execute(text(
+        "UPDATE dm_templates SET usage_count = usage_count + :n WHERE id = :tid"
+    ), {"n": len(created), "tid": req.template_id})
+    await db.commit()
+
+    return {"created": len(created), "tasks": created, "template_content": template[1]}
+
+
+@app.get("/outreach/tasks")
+async def list_outreach_tasks(
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+    user: dict = Depends(get_token_user),
+    db: AsyncSession = Depends(get_db),
+):
+    where = ["ot.user_id = :uid"]
+    params = {"uid": user["id"]}
+    if status:
+        where.append("ot.status = :status")
+        params["status"] = status
+    where_clause = " AND ".join(where)
+
+    count_r = await db.execute(text(f"SELECT COUNT(*) FROM outreach_tasks ot WHERE {where_clause}"), params)
+    total = count_r.fetchone()[0]
+
+    offset = (page - 1) * page_size
+    result = await db.execute(text(
+        f"SELECT ot.*, l.name as lead_name, l.phone as lead_phone, "
+        f"dt.name as template_name, dt.content as template_content "
+        f"FROM outreach_tasks ot "
+        f"LEFT JOIN leads l ON ot.lead_id = l.id "
+        f"LEFT JOIN dm_templates dt ON ot.template_id = dt.id "
+        f"WHERE {where_clause} ORDER BY ot.created_at DESC LIMIT :limit OFFSET :offset"
+    ), {**params, "limit": page_size, "offset": offset})
+    rows = result.fetchall()
+    items = [{
+        "id": r[0], "user_id": r[1], "lead_id": r[2], "template_id": r[3],
+        "platform": r[4], "target_user_id": r[5], "status": r[6],
+        "result_message": r[7], "sent_at": r[8], "created_at": r[9],
+        "lead_name": r[10], "lead_phone": r[11],
+        "template_name": r[12], "template_content": r[13],
+    } for r in rows]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@app.post("/outreach/execute")
+async def execute_outreach(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    """Execute all pending outreach tasks via RPA engine."""
+    result = await db.execute(text(
+        "SELECT ot.id, ot.lead_id, l.name, l.phone, dt.content, dt.image_url "
+        "FROM outreach_tasks ot "
+        "LEFT JOIN leads l ON ot.lead_id = l.id "
+        "LEFT JOIN dm_templates dt ON ot.template_id = dt.id "
+        "WHERE ot.user_id = :uid AND ot.status = 'pending' "
+        "ORDER BY ot.created_at ASC LIMIT 10"
+    ), {"uid": user["id"]})
+    tasks = result.fetchall()
+    if not tasks:
+        return {"message": "没有待执行的触达任务", "executed": 0}
+
+    import rpa_outreach
+    results = await rpa_outreach.execute_batch([
+        {"task_id": t[0], "lead_id": t[1], "lead_name": t[2], "lead_phone": t[3],
+         "content": t[4], "image_url": t[5]}
+        for t in tasks
+    ])
+
+    now = now_cst().isoformat()
+    for r in results:
+        await db.execute(text(
+            "UPDATE outreach_tasks SET status = :status, result_message = :msg, sent_at = :now WHERE id = :tid"
+        ), {"status": r["status"], "msg": r.get("message", ""), "now": now, "tid": r["task_id"]})
+    await db.commit()
+
+    succeeded = sum(1 for r in results if r["status"] == "sent")
+    return {"message": f"执行完成：{succeeded}/{len(results)} 成功", "executed": len(results), "results": results}
+
+
+@app.get("/outreach/stats")
+async def outreach_stats(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(text(
+        "SELECT status, COUNT(*) FROM outreach_tasks WHERE user_id = :uid GROUP BY status"
+    ), {"uid": user["id"]})
+    by_status = {row[0]: row[1] for row in result.fetchall()}
+    total_r = await db.execute(text(
+        "SELECT COUNT(*) FROM outreach_tasks WHERE user_id = :uid"
+    ), {"uid": user["id"]})
+    today_r = await db.execute(text(
+        "SELECT COUNT(*) FROM outreach_tasks WHERE user_id = :uid AND created_at >= :today"
+    ), {"uid": user["id"], "today": now_cst().strftime("%Y-%m-%d") + "%"})
+    return {
+        "total": total_r.fetchone()[0],
+        "today": today_r.fetchone()[0],
+        "sent": by_status.get("sent", 0),
+        "failed": by_status.get("failed", 0),
+        "pending": by_status.get("pending", 0),
+        "replied": by_status.get("replied", 0),
+    }
+
+
 # ============ Feedback ============
 
 class FeedbackReq(BaseModel):
@@ -1190,6 +1673,32 @@ async def init_db():
             monthly_video_count INTEGER DEFAULT 30, account_limit INTEGER DEFAULT 1,
             storage_bytes_used INTEGER DEFAULT 0, storage_bytes_limit INTEGER DEFAULT 1073741824,
             updated_at TEXT
+        )"""))
+        await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS lead_forms (
+            id TEXT PRIMARY KEY, user_id TEXT, title TEXT, description TEXT,
+            fields TEXT, video_url TEXT, is_active INTEGER DEFAULT 1,
+            share_code TEXT UNIQUE, created_at TEXT
+        )"""))
+        await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS leads (
+            id TEXT PRIMARY KEY, user_id TEXT, form_id TEXT, name TEXT, phone TEXT,
+            company TEXT, message TEXT, source TEXT DEFAULT 'form',
+            source_video_url TEXT, status TEXT DEFAULT 'new', notes TEXT,
+            created_at TEXT, updated_at TEXT
+        )"""))
+        await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS dm_templates (
+            id TEXT PRIMARY KEY, user_id TEXT, name TEXT, content TEXT,
+            image_url TEXT, platform TEXT DEFAULT 'douyin',
+            usage_count INTEGER DEFAULT 0, created_at TEXT
+        )"""))
+        await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS outreach_tasks (
+            id TEXT PRIMARY KEY, user_id TEXT, lead_id TEXT, template_id TEXT,
+            platform TEXT DEFAULT 'douyin', target_user_id TEXT,
+            status TEXT DEFAULT 'pending', result_message TEXT,
+            sent_at TEXT, created_at TEXT
         )"""))
     print("SQLite 数据库已初始化 (aihuoke.db)")
 
