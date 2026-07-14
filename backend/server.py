@@ -475,6 +475,10 @@ async def upload_material(file: UploadFile = File(...), folder_id: str | None = 
     await db.execute(text(
         "INSERT INTO materials (id, user_id, folder_id, type, file_name, file_url, size, duration, tags, created_at) VALUES (:id, :uid, :fid, :type, :name, :url, :size, :dur, '{}', :now)"
     ), {"id": mid, "uid": user["id"], "fid": folder_id, "type": ftype, "name": file.filename, "url": rel_url, "size": file_size, "dur": None, "now": now})
+    # Track storage usage
+    await db.execute(text(
+        "UPDATE user_quotas SET storage_bytes_used = storage_bytes_used + :size, updated_at = :now WHERE user_id = :uid"
+    ), {"size": file_size, "uid": user["id"], "now": now})
     await db.commit()
     return {"id": mid, "type": ftype, "file_name": file.filename, "file_url": rel_url, "thumbnail_url": None, "duration": None, "size": file_size, "tags": [], "created_at": now}
 
@@ -513,13 +517,19 @@ async def list_materials(
 @app.delete("/content/materials/{material_id}")
 async def delete_material(material_id: str, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
-    # Get file_url before deleting the record
-    result = await db.execute(text("SELECT file_url FROM materials WHERE id=:id AND user_id=:uid"), {"id": material_id, "uid": user["id"]})
+    # Get file_url and size before deleting the record
+    result = await db.execute(text("SELECT file_url, size FROM materials WHERE id=:id AND user_id=:uid"), {"id": material_id, "uid": user["id"]})
     row = result.fetchone()
     if not row:
         raise HTTPException(404, "素材不存在")
     file_path = UPLOAD_DIR / row[0].lstrip("/uploads/")
+    file_size = row[1] or 0
     await db.execute(text("DELETE FROM materials WHERE id=:id AND user_id=:uid"), {"id": material_id, "uid": user["id"]})
+    # Track storage usage
+    now = now_cst().isoformat()
+    await db.execute(text(
+        "UPDATE user_quotas SET storage_bytes_used = MAX(0, storage_bytes_used - :size), updated_at = :now WHERE user_id = :uid"
+    ), {"size": file_size, "uid": user["id"], "now": now})
     await db.commit()
     # Clean up file on disk
     if file_path.exists():
@@ -535,15 +545,22 @@ async def batch_delete_materials(req: dict, user: dict = Depends(get_token_user)
     if not ids:
         raise HTTPException(400, "请提供要删除的素材ID列表")
     deleted = 0
+    total_freed = 0
     for mid in ids:
-        result = await db.execute(text("SELECT file_url FROM materials WHERE id=:id AND user_id=:uid"), {"id": mid, "uid": user["id"]})
+        result = await db.execute(text("SELECT file_url, size FROM materials WHERE id=:id AND user_id=:uid"), {"id": mid, "uid": user["id"]})
         row = result.fetchone()
         if row:
             file_path = UPLOAD_DIR / row[0].lstrip("/uploads/")
+            total_freed += row[1] or 0
             await db.execute(text("DELETE FROM materials WHERE id=:id AND user_id=:uid"), {"id": mid, "uid": user["id"]})
             if file_path.exists():
                 file_path.unlink(missing_ok=True)
             deleted += 1
+    if total_freed > 0:
+        now = now_cst().isoformat()
+        await db.execute(text(
+            "UPDATE user_quotas SET storage_bytes_used = MAX(0, storage_bytes_used - :size), updated_at = :now WHERE user_id = :uid"
+        ), {"size": total_freed, "uid": user["id"], "now": now})
     await db.commit()
     return {"ok": True, "deleted": deleted}
 
@@ -567,6 +584,32 @@ async def create_folder(req: CreateFolderReq, user: dict = Depends(get_token_use
 @app.post("/content/edit-tasks")
 async def create_edit_task(req: CreateEditTaskReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
+
+    # Quota check: count today's and this month's tasks
+    today_start = now_cst().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    month_start = now_cst().replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    daily_res = await db.execute(text(
+        "SELECT COUNT(*) FROM edit_tasks WHERE user_id = :uid AND created_at >= :today"
+    ), {"uid": user["id"], "today": today_start})
+    daily_used = daily_res.fetchone()[0]
+    monthly_res = await db.execute(text(
+        "SELECT COUNT(*) FROM edit_tasks WHERE user_id = :uid AND created_at >= :month"
+    ), {"uid": user["id"], "month": month_start})
+    monthly_used = monthly_res.fetchone()[0]
+
+    # Get user's quota limits
+    q_res = await db.execute(text(
+        "SELECT daily_video_count, monthly_video_count FROM user_quotas WHERE user_id = :uid"
+    ), {"uid": user["id"]})
+    q_row = q_res.fetchone()
+    daily_limit = q_row[0] if q_row else 3
+    monthly_limit = q_row[1] if q_row else 30
+
+    if daily_used >= daily_limit:
+        raise HTTPException(429, f"今日配额已用完（{daily_used}/{daily_limit}），请明天再试或升级套餐")
+    if monthly_used >= monthly_limit:
+        raise HTTPException(429, f"本月配额已用完（{monthly_used}/{monthly_limit}），请下月再试或升级套餐")
+
     tid = str(uuid.uuid4())
     now = now_cst().isoformat()
     await db.execute(text("INSERT INTO edit_tasks (id, user_id, material_ids, copywriting_id, template_id, params, status, progress, output_urls, created_at) VALUES (:id, :uid, :mids, :cid, :tid, :params, 'pending', 0, '', :now)"), {"id": tid, "uid": user["id"], "mids": ",".join(req.material_ids), "cid": req.copywriting_id, "tid": req.template_id, "params": req.model_dump_json(), "now": now})
@@ -991,15 +1034,44 @@ async def quota_usage(user: dict = Depends(get_token_user), db: AsyncSession = D
     from sqlalchemy import text
     result = await db.execute(text("SELECT daily_video_count, monthly_video_count, account_limit, storage_bytes_used, storage_bytes_limit FROM user_quotas WHERE user_id = :uid"), {"uid": user["id"]})
     row = result.fetchone()
-    if row:
-        return {
-            "plan": user.get("plan_type", "free"), "plan_name": {"free": "免费版", "basic": "基础版", "pro": "专业版", "enterprise": "企业版"}.get(user.get("plan_type", "free"), "免费版"),
-            "daily_edit": {"used": 0, "limit": row[0]},
-            "monthly_edit": {"used": 0, "limit": row[1]},
-            "accounts": {"used": 0, "limit": row[2]},
-            "storage": {"used": row[3], "used_gb": round(row[3]/(1024**3), 2), "limit": row[4], "limit_gb": round(row[4]/(1024**3), 1)},
-        }
-    return {"plan": "free", "plan_name": "免费版", "daily_edit": {"used": 0, "limit": 3}, "monthly_edit": {"used": 0, "limit": 30}, "accounts": {"used": 0, "limit": 1}, "storage": {"used": 0, "used_gb": 0, "limit": 1073741824, "limit_gb": 1.0}}
+    if not row:
+        return {"plan": "free", "plan_name": "免费版", "daily_edit": {"used": 0, "limit": 3}, "monthly_edit": {"used": 0, "limit": 30}, "accounts": {"used": 0, "limit": 1}, "storage": {"used": 0, "used_gb": 0, "limit": 1073741824, "limit_gb": 1.0}}
+
+    # Count daily edit tasks (today in CST)
+    today_start = now_cst().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    daily_res = await db.execute(text(
+        "SELECT COUNT(*) FROM edit_tasks WHERE user_id = :uid AND created_at >= :today"
+    ), {"uid": user["id"], "today": today_start})
+    daily_used = daily_res.fetchone()[0]
+
+    # Count monthly edit tasks
+    month_start = now_cst().replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    monthly_res = await db.execute(text(
+        "SELECT COUNT(*) FROM edit_tasks WHERE user_id = :uid AND created_at >= :month"
+    ), {"uid": user["id"], "month": month_start})
+    monthly_used = monthly_res.fetchone()[0]
+
+    # Count platform accounts
+    acc_res = await db.execute(text(
+        "SELECT COUNT(*) FROM platform_accounts WHERE user_id = :uid"
+    ), {"uid": user["id"]})
+    acc_used = acc_res.fetchone()[0]
+
+    # Sum storage from materials table
+    storage_res = await db.execute(text(
+        "SELECT COALESCE(SUM(size), 0) FROM materials WHERE user_id = :uid"
+    ), {"uid": user["id"]})
+    storage_used = storage_res.fetchone()[0]
+
+    plan_name = {"free": "免费版", "basic": "基础版", "pro": "专业版", "enterprise": "企业版"}.get(user.get("plan_type", "free"), "免费版")
+    return {
+        "plan": user.get("plan_type", "free"),
+        "plan_name": plan_name,
+        "daily_edit": {"used": daily_used, "limit": row[0]},
+        "monthly_edit": {"used": monthly_used, "limit": row[1]},
+        "accounts": {"used": acc_used, "limit": row[2]},
+        "storage": {"used": storage_used, "used_gb": round(storage_used / (1024**3), 2), "limit": row[4], "limit_gb": round(row[4] / (1024**3), 1)},
+    }
 
 # ============ Feedback ============
 
@@ -1067,7 +1139,7 @@ async def init_db():
         await conn.execute(text("""
         CREATE TABLE IF NOT EXISTS user_quotas (
             id TEXT PRIMARY KEY, user_id TEXT UNIQUE, daily_video_count INTEGER DEFAULT 3,
-            monthly_video_count INTEGER DEFAULT 90, account_limit INTEGER DEFAULT 1,
+            monthly_video_count INTEGER DEFAULT 30, account_limit INTEGER DEFAULT 1,
             storage_bytes_used INTEGER DEFAULT 0, storage_bytes_limit INTEGER DEFAULT 1073741824,
             updated_at TEXT
         )"""))
