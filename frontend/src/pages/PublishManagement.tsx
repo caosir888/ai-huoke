@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { Card, Table, Tag, Button, Modal, Select, Input, DatePicker, Space, message, Statistic, Row, Col } from 'antd';
+import { useState, useEffect, useRef } from 'react';
+import { Card, Table, Tag, Button, Modal, Select, Input, DatePicker, Space, message, Statistic, Row, Col, Progress } from 'antd';
 import { SendOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
@@ -40,7 +40,23 @@ export default function PublishManagement() {
     setLoading(false);
   };
 
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   useEffect(() => { fetchData(); }, []);
+
+  // Auto-poll when any task is publishing
+  useEffect(() => {
+    const hasPublishing = tasks.some(t => t.status === 'publishing');
+    if (hasPublishing && !pollingRef.current) {
+      pollingRef.current = setInterval(fetchData, 2000);
+    } else if (!hasPublishing && pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+    return () => {
+      if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
+    };
+  }, [tasks]);
 
   const handlePublish = async () => {
     if (!videoUrl || !selectedAccount || !title) {
@@ -70,6 +86,8 @@ export default function PublishManagement() {
     { title: '标题', dataIndex: 'title', key: 'title', ellipsis: true },
     { title: '状态', dataIndex: 'status', key: 'status', width: 100,
       render: (s: string) => <Tag color={statusColors[s]}>{statusText[s]}</Tag> },
+    { title: '进度', key: 'progress', width: 120,
+      render: (_, r) => r.status === 'publishing' ? <Progress percent={r.progress || 0} size="small" style={{ width: 100 }} /> : (r.status === 'published' ? <span style={{ color: '#52c41a' }}>100%</span> : '-') },
     { title: '平台', dataIndex: 'platform_account_id', key: 'platform', width: 100 },
     { title: '播放', key: 'plays', width: 80,
       render: (_, r) => r.metrics?.plays || '-' },

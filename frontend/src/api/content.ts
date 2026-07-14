@@ -1,7 +1,7 @@
 import api from './client';
 
-export const generateCopywriting = (keywords: string, style: string, count = 5) =>
-  api.post('/content/copywriting/generate', { keywords, style, count });
+export const generateCopywriting = (keywords: string, style: string, count = 5, industry = '通用', referenceStructure?: any) =>
+  api.post('/content/copywriting/generate', { keywords, style, count, industry, reference_structure: referenceStructure });
 
 export const parseLink = (url: string) => api.post('/content/copywriting/parse-link', { url });
 

@@ -2,6 +2,9 @@
 本地开发服务器 — 使用 SQLite，无需安装任何数据库。
 启动: python server.py
 """
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import sys
 import uuid
@@ -156,6 +159,7 @@ class GenerateCopywritingReq(BaseModel):
     style: str = "口播"
     count: int = 5
     industry: str = "通用"
+    reference_structure: dict | None = None
 
 class ParseLinkReq(BaseModel):
     url: str
@@ -364,6 +368,16 @@ async def generate_copywriting(req: GenerateCopywritingReq, user: dict = Depends
 
     # Try DeepSeek API first
     prompt = f"请为以下产品/服务生成{req.count}条短视频营销文案：\n关键词：{req.keywords}\n行业：{req.industry}\n风格：{req.style}"
+
+    if req.reference_structure:
+        ref = req.reference_structure
+        prompt += (
+            f"\n请模仿以下爆款结构来创作："
+            f"\n- 标题公式：{ref.get('title_formula', '')}"
+            f"\n- 正文结构：{ref.get('body_structure', '')}"
+            f"\n- 标签策略：{ref.get('tag_strategy', '')}"
+            f"\n- 可模仿要素：{ref.get('key_elements', '')}"
+        )
     items = await call_deepseek(prompt)
 
     if items is None:
@@ -600,10 +614,10 @@ class CreatePublishTaskReq(BaseModel):
 @app.get("/publish/tasks")
 async def list_publish_tasks(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
-    result = await db.execute(text("SELECT id, video_url, platform_account_id, title, schedule_type, schedule_time, status, publish_result, metrics, created_at FROM publish_tasks WHERE user_id = :uid ORDER BY created_at DESC LIMIT 100"), {"uid": user["id"]})
+    result = await db.execute(text("SELECT id, video_url, platform_account_id, title, schedule_type, schedule_time, status, progress, publish_result, metrics, error_message, created_at FROM publish_tasks WHERE user_id = :uid ORDER BY created_at DESC LIMIT 100"), {"uid": user["id"]})
     rows = result.fetchall()
     import json
-    return [{"id": r[0], "video_url": r[1], "platform_account_id": r[2], "title": r[3], "schedule_type": r[4], "schedule_time": r[5], "status": r[6], "publish_result": json.loads(r[7]) if r[7] else None, "metrics": json.loads(r[8]) if r[8] else {}, "created_at": r[9]} for r in rows]
+    return [{"id": r[0], "video_url": r[1], "platform_account_id": r[2], "title": r[3], "schedule_type": r[4], "schedule_time": r[5], "status": r[6], "progress": r[7], "publish_result": json.loads(r[8]) if r[8] else None, "metrics": json.loads(r[9]) if r[9] else {}, "error_message": r[10], "created_at": r[11]} for r in rows]
 
 @app.post("/publish/tasks")
 async def create_publish_task(req: CreatePublishTaskReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
@@ -611,11 +625,68 @@ async def create_publish_task(req: CreatePublishTaskReq, user: dict = Depends(ge
     import json
     tid = str(uuid.uuid4())
     now = now_cst().isoformat()
+    # Start as "publishing" so UI shows progress
+    initial_status = "publishing" if req.schedule_type == "now" else "pending"
     await db.execute(text(
-        "INSERT INTO publish_tasks (id, user_id, video_url, platform_account_id, title, schedule_type, schedule_time, status, metrics, created_at) VALUES (:id, :uid, :url, :aid, :title, :st, :sch, 'published', :metrics, :now)"
-    ), {"id": tid, "uid": user["id"], "url": req.video_url, "aid": req.platform_account_id, "title": req.title, "st": req.schedule_type, "sch": req.schedule_time, "metrics": json.dumps({"plays": 0, "likes": 0, "comments": 0, "shares": 0}), "now": now})
+        "INSERT INTO publish_tasks (id, user_id, video_url, platform_account_id, title, schedule_type, schedule_time, status, progress, metrics, created_at) "
+        "VALUES (:id, :uid, :url, :aid, :title, :st, :sch, :status, :prog, :metrics, :now)"
+    ), {"id": tid, "uid": user["id"], "url": req.video_url, "aid": req.platform_account_id, "title": req.title,
+        "st": req.schedule_type, "sch": req.schedule_time, "status": initial_status, "prog": 0,
+        "metrics": json.dumps({"plays": 0, "likes": 0, "comments": 0, "shares": 0}), "now": now})
     await db.commit()
-    return {"id": tid, "video_url": req.video_url, "platform_account_id": req.platform_account_id, "title": req.title, "schedule_type": req.schedule_type, "schedule_time": req.schedule_time, "status": "published", "publish_result": None, "metrics": {}, "created_at": now}
+
+    if req.schedule_type == "now":
+        asyncio.create_task(_simulate_publish(tid, user["id"]))
+
+    return {"id": tid, "video_url": req.video_url, "platform_account_id": req.platform_account_id,
+            "title": req.title, "schedule_type": req.schedule_type, "schedule_time": req.schedule_time,
+            "status": initial_status, "publish_result": None, "metrics": {}, "created_at": now}
+
+
+async def _simulate_publish(task_id: str, user_id: str):
+    """Simulate publishing progress with realistic delays and mock metrics."""
+    import random
+    from sqlalchemy import text as sql_text
+
+    async with async_session() as db:
+        try:
+            stages = [
+                (20, "上传视频中...", 1.5),
+                (50, "转码处理中...", 2.0),
+                (70, "平台审核中...", 2.0),
+                (90, "发布中...", 1.0),
+                (100, "发布成功", 0.5),
+            ]
+            for progress, msg, delay in stages:
+                await asyncio.sleep(delay)
+                await db.execute(sql_text(
+                    "UPDATE publish_tasks SET progress=:p WHERE id=:id"
+                ), {"p": progress, "id": task_id})
+                await db.commit()
+
+            # Generate mock metrics
+            base_plays = random.randint(200, 5000)
+            metrics = {
+                "plays": base_plays,
+                "likes": int(base_plays * random.uniform(0.02, 0.08)),
+                "comments": int(base_plays * random.uniform(0.001, 0.01)),
+                "shares": int(base_plays * random.uniform(0.002, 0.02)),
+            }
+            publish_result = {
+                "platform_post_id": f"dy_{random.randint(10000000, 99999999)}",
+                "publish_url": f"https://v.douyin.com/mock_{task_id[:8]}/",
+                "published_at": now_cst().isoformat(),
+            }
+            await db.execute(sql_text(
+                "UPDATE publish_tasks SET status='published', progress=100, publish_result=:pr, metrics=:m WHERE id=:id"
+            ), {"pr": json.dumps(publish_result), "m": json.dumps(metrics), "id": task_id})
+            await db.commit()
+        except Exception as e:
+            await db.execute(sql_text(
+                "UPDATE publish_tasks SET status='failed', error_message=:msg WHERE id=:id"
+            ), {"msg": str(e), "id": task_id})
+            await db.commit()
+
 
 # ============ Platform ============
 

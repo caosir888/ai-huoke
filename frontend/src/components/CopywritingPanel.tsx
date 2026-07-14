@@ -26,6 +26,8 @@ export default function CopywritingPanel() {
   const [parsing, setParsing] = useState(false);
   const [parseResult, setParseResult] = useState<any>(null);
   const [parseModalOpen, setParseModalOpen] = useState(false);
+  const [rewriteKeywords, setRewriteKeywords] = useState('');
+  const [rewriting, setRewriting] = useState(false);
   const [loading, setLoading] = useState(false);
 
   const fetchList = async () => {
@@ -65,6 +67,19 @@ export default function CopywritingPanel() {
   const handleCopy = (text: string) => {
     navigator.clipboard.writeText(text);
     message.success('已复制');
+  };
+
+  const handleRewrite = async () => {
+    if (!rewriteKeywords.trim()) { message.warning('请输入要仿写的产品/服务关键词'); return; }
+    setRewriting(true);
+    try {
+      await generateCopywriting(rewriteKeywords, '口播', 3, '通用', parseResult);
+      showSuccess('仿写完成，已生成3条文案');
+      setParseModalOpen(false);
+      setRewriteKeywords('');
+      await fetchList();
+    } catch (err) { handleApiError(err, '仿写失败'); }
+    setRewriting(false);
   };
 
   return (
@@ -139,7 +154,21 @@ export default function CopywritingPanel() {
       </Spin>
 
       <Modal title="链接解析结果" open={parseModalOpen}
-        onCancel={() => setParseModalOpen(false)} footer={null}>
+        onCancel={() => { setParseModalOpen(false); setRewriteKeywords(''); }}
+        footer={
+          <Space style={{ width: '100%', justifyContent: 'flex-end' }}>
+            <Input
+              placeholder="输入你的产品/服务关键词，如：成都冒烤鸭"
+              value={rewriteKeywords}
+              onChange={(e) => setRewriteKeywords(e.target.value)}
+              style={{ width: 260 }}
+            />
+            <Button type="primary" loading={rewriting}
+              onClick={handleRewrite} icon={<ThunderboltOutlined />}>
+              仿写生成
+            </Button>
+          </Space>
+        }>
         {parseResult && (
           <div>
             <p><strong>标题公式：</strong>{parseResult.title_formula}</p>
