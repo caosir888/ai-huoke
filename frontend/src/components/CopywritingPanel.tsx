@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Card, Input, Select, Button, List, Tag, message, Space, Modal, Spin } from 'antd';
+import { Card, Input, Select, Button, Tag, message, Space, Modal, Spin } from 'antd';
 import { ThunderboltOutlined, LinkOutlined, CopyOutlined, StarOutlined, StarFilled } from '@ant-design/icons';
 import { generateCopywriting, listCopywriting, parseLink } from '../api/content';
 import { handleApiError, showSuccess } from '../utils/errorHandler';
@@ -123,10 +123,11 @@ export default function CopywritingPanel() {
       </Card>
 
       <Spin spinning={loading}>
-        <List
-          dataSource={items}
-          renderItem={(item) => (
-            <Card size="small" style={{ marginBottom: 12 }}
+        {items.length === 0 ? (
+          <div style={{ color: '#999', textAlign: 'center', padding: 40 }}>还没有文案，输入关键词生成吧</div>
+        ) : (
+          items.map((item) => (
+            <Card key={item.id} size="small" style={{ marginBottom: 12 }}
               title={
                 <Space>
                   <Tag color={item.style === '口播' ? 'blue' : item.style === '展示' ? 'green' : item.style === '促销' ? 'red' : 'purple'}>
@@ -148,9 +149,8 @@ export default function CopywritingPanel() {
               <p style={{ whiteSpace: 'pre-wrap', marginBottom: 8 }}>{item.body}</p>
               {item.tags && <div>{item.tags.split(' ').filter(Boolean).map((t: string) => <Tag key={t}>{t}</Tag>)}</div>}
             </Card>
-          )}
-          locale={{ emptyText: '还没有文案，输入关键词生成吧' }}
-        />
+          ))
+        )}
       </Spin>
 
       <Modal title="链接解析结果" open={parseModalOpen}

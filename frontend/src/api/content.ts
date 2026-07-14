@@ -11,10 +11,13 @@ export const listCopywriting = (style?: string) =>
 export const uploadMaterial = (formData: FormData) =>
   api.post('/content/materials/upload', formData);
 
-export const listMaterials = (params?: { folder_id?: string; type?: string }) =>
+export const listMaterials = (params?: { folder_id?: string; type?: string; search?: string; sort_by?: string; sort_order?: string }) =>
   api.get('/content/materials', { params });
 
 export const deleteMaterial = (id: string) => api.delete(`/content/materials/${id}`);
+
+export const batchDeleteMaterials = (ids: string[]) =>
+  api.post('/content/materials/batch-delete', { ids });
 
 export const createFolder = (name: string, parentId?: string) =>
   api.post('/content/folders', { name, parent_id: parentId });

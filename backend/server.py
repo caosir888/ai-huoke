@@ -479,14 +479,74 @@ async def upload_material(file: UploadFile = File(...), folder_id: str | None = 
     return {"id": mid, "type": ftype, "file_name": file.filename, "file_url": rel_url, "thumbnail_url": None, "duration": None, "size": file_size, "tags": [], "created_at": now}
 
 @app.get("/content/materials")
-async def list_materials(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db), type: str | None = None):
+async def list_materials(
+    user: dict = Depends(get_token_user),
+    db: AsyncSession = Depends(get_db),
+    type: str | None = None,
+    search: str | None = None,
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
+):
     from sqlalchemy import text
+    allowed_sort = {"created_at", "size", "file_name", "duration"}
+    if sort_by not in allowed_sort:
+        sort_by = "created_at"
+    if sort_order not in ("asc", "desc"):
+        sort_order = "desc"
+
+    conditions = ["user_id = :uid"]
+    params: dict = {"uid": user["id"]}
+
     if type:
-        result = await db.execute(text("SELECT id, type, file_name, file_url, thumbnail_url, duration, size, tags, created_at FROM materials WHERE user_id = :uid AND type = :type ORDER BY created_at DESC LIMIT 100"), {"uid": user["id"], "type": type})
-    else:
-        result = await db.execute(text("SELECT id, type, file_name, file_url, thumbnail_url, duration, size, tags, created_at FROM materials WHERE user_id = :uid ORDER BY created_at DESC LIMIT 100"), {"uid": user["id"]})
+        conditions.append("type = :type")
+        params["type"] = type
+    if search:
+        conditions.append("(file_name LIKE :kw OR tags LIKE :kw)")
+        params["kw"] = f"%{search}%"
+
+    where = " AND ".join(conditions)
+    query = f"SELECT id, type, file_name, file_url, thumbnail_url, duration, size, tags, created_at FROM materials WHERE {where} ORDER BY {sort_by} {sort_order} LIMIT 200"
+    result = await db.execute(text(query), params)
     rows = result.fetchall()
     return [{"id": r[0], "type": r[1], "file_name": r[2], "file_url": r[3], "thumbnail_url": r[4], "duration": r[5], "size": r[6], "tags": r[7].split(",") if isinstance(r[7], str) else [], "created_at": r[8]} for r in rows]
+
+@app.delete("/content/materials/{material_id}")
+async def delete_material(material_id: str, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import text
+    # Get file_url before deleting the record
+    result = await db.execute(text("SELECT file_url FROM materials WHERE id=:id AND user_id=:uid"), {"id": material_id, "uid": user["id"]})
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(404, "素材不存在")
+    file_path = UPLOAD_DIR / row[0].lstrip("/uploads/")
+    await db.execute(text("DELETE FROM materials WHERE id=:id AND user_id=:uid"), {"id": material_id, "uid": user["id"]})
+    await db.commit()
+    # Clean up file on disk
+    if file_path.exists():
+        file_path.unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@app.post("/content/materials/batch-delete")
+async def batch_delete_materials(req: dict, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    """Batch delete materials by IDs. Body: {ids: [...]}"""
+    from sqlalchemy import text
+    ids = req.get("ids", [])
+    if not ids:
+        raise HTTPException(400, "请提供要删除的素材ID列表")
+    deleted = 0
+    for mid in ids:
+        result = await db.execute(text("SELECT file_url FROM materials WHERE id=:id AND user_id=:uid"), {"id": mid, "uid": user["id"]})
+        row = result.fetchone()
+        if row:
+            file_path = UPLOAD_DIR / row[0].lstrip("/uploads/")
+            await db.execute(text("DELETE FROM materials WHERE id=:id AND user_id=:uid"), {"id": mid, "uid": user["id"]})
+            if file_path.exists():
+                file_path.unlink(missing_ok=True)
+            deleted += 1
+    await db.commit()
+    return {"ok": True, "deleted": deleted}
+
 
 @app.get("/content/folders")
 async def list_folders(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
@@ -545,7 +605,9 @@ async def _simulate_edit(task_id: str, count: int, user_id: str):
             # Fetch copywriting + voice + duration params
             copywriting_text = ""
             voice = "none"
+            template_id = "mix"
             total_duration = 30  # default 30s
+            ratio = "16:9"
             task_result = await db.execute(sql_text("SELECT copywriting_id, params FROM edit_tasks WHERE id=:id"), {"id": task_id})
             task_row = task_result.fetchone()
             if task_row:
@@ -559,6 +621,8 @@ async def _simulate_edit(task_id: str, count: int, user_id: str):
                         params = json.loads(task_row[1])
                         voice = params.get("voice", "none")
                         total_duration = params.get("duration", 30)
+                        template_id = params.get("template_id", "mix")
+                        ratio = params.get("ratio", "16:9")
                     except (json.JSONDecodeError, TypeError):
                         pass
 
@@ -575,18 +639,36 @@ async def _simulate_edit(task_id: str, count: int, user_id: str):
                 total_duration=total_duration,
                 subtitle=copywriting_text,
                 voice=voice,
+                template=template_id,
+                ratio=ratio,
             )
             # =========================
 
-            # Build relative URLs from output paths
+            # Dedup quality check
+            quality_report = {}
+            if len(output_paths) > 1:
+                quality_report = await asyncio.to_thread(
+                    mixer.check_dedup_quality, output_paths
+                )
+                if not quality_report.get("passed", True):
+                    print(f"[EDIT] WARNING: Dedup quality low - {quality_report.get('dedup_ratio', '?')} unique")
+                else:
+                    print(f"[EDIT] Dedup quality OK - {quality_report.get('dedup_ratio', '?')} unique ({quality_report.get('unique_count')}/{quality_report.get('total_count')})")
+
+            # Build relative URLs from output paths + generate thumbnails
             output_urls = []
+            thumbnail_urls = []
             for op in output_paths:
                 fname = Path(op).name
                 output_urls.append(f"/videos/{user_id}/{fname}")
+                # Generate thumbnail from first frame
+                thumb_path = await asyncio.to_thread(mixer.make_thumbnail, op)
+                if thumb_path:
+                    thumbnail_urls.append(f"/videos/{user_id}/{Path(thumb_path).name}")
 
             await db.execute(sql_text(
-                "UPDATE edit_tasks SET status='done', progress=100, output_urls=:urls WHERE id=:id"
-            ), {"urls": ",".join(output_urls), "id": task_id})
+                "UPDATE edit_tasks SET status='done', progress=100, output_urls=:urls, quality_report=:qr, thumbnail_urls=:thumbs WHERE id=:id"
+            ), {"urls": ",".join(output_urls), "qr": json.dumps(quality_report) if quality_report else "", "thumbs": ",".join(thumbnail_urls), "id": task_id})
             await db.commit()
 
         except Exception as e:
@@ -598,9 +680,9 @@ async def _simulate_edit(task_id: str, count: int, user_id: str):
 @app.get("/content/edit-tasks")
 async def list_edit_tasks(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
-    result = await db.execute(text("SELECT id, material_ids, status, progress, output_urls, error_message, created_at FROM edit_tasks WHERE user_id = :uid ORDER BY created_at DESC LIMIT 50"), {"uid": user["id"]})
+    result = await db.execute(text("SELECT id, material_ids, status, progress, output_urls, thumbnail_urls, error_message, quality_report, created_at FROM edit_tasks WHERE user_id = :uid ORDER BY created_at DESC LIMIT 50"), {"uid": user["id"]})
     rows = result.fetchall()
-    return [{"id": r[0], "material_ids": r[1].split(",") if isinstance(r[1], str) and r[1] else [], "status": r[2], "progress": r[3], "output_urls": r[4].split(",") if isinstance(r[4], str) and r[4] else [], "error_message": r[5], "created_at": r[6]} for r in rows]
+    return [{"id": r[0], "material_ids": r[1].split(",") if isinstance(r[1], str) and r[1] else [], "status": r[2], "progress": r[3], "output_urls": r[4].split(",") if isinstance(r[4], str) and r[4] else [], "thumbnail_urls": r[5].split(",") if isinstance(r[5], str) and r[5] else [], "error_message": r[6], "quality_report": json.loads(r[7]) if r[7] else None, "created_at": r[8]} for r in rows]
 
 # ============ Publish ============
 
@@ -686,6 +768,168 @@ async def _simulate_publish(task_id: str, user_id: str):
                 "UPDATE publish_tasks SET status='failed', error_message=:msg WHERE id=:id"
             ), {"msg": str(e), "id": task_id})
             await db.commit()
+
+
+async def _publish_scheduler():
+    """Background scheduler: poll for due timed tasks every 30s and fire them."""
+    from sqlalchemy import text as sql_text
+    while True:
+        try:
+            await asyncio.sleep(30)
+            async with async_session() as db:
+                now = now_cst().isoformat()
+                result = await db.execute(sql_text(
+                    "SELECT id, user_id FROM publish_tasks WHERE status='pending' AND schedule_type='timed' AND schedule_time <= :now"
+                ), {"now": now})
+                due = result.fetchall()
+                for row in due:
+                    tid, uid = row[0], row[1]
+                    print(f"[SCHEDULER] Firing scheduled publish task {tid[:8]}...")
+                    asyncio.create_task(_simulate_publish(tid, uid))
+        except Exception as e:
+            print(f"[SCHEDULER] Error: {e}")
+
+
+@app.post("/publish/reschedule/{task_id}")
+async def reschedule_task(task_id: str, schedule_time: str, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    """Reschedule a pending timed publish task."""
+    from sqlalchemy import text
+    result = await db.execute(text(
+        "UPDATE publish_tasks SET schedule_time=:st WHERE id=:id AND user_id=:uid AND status='pending'"
+    ), {"st": schedule_time, "id": task_id, "uid": user["id"]})
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(400, "任务不存在、不属于你或状态不是待发布")
+    return {"ok": True, "id": task_id, "schedule_time": schedule_time}
+
+
+@app.post("/publish/cancel/{task_id}")
+async def cancel_publish_task(task_id: str, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    """Cancel a pending timed publish task."""
+    from sqlalchemy import text
+    result = await db.execute(text(
+        "UPDATE publish_tasks SET status='cancelled' WHERE id=:id AND user_id=:uid AND status='pending'"
+    ), {"id": task_id, "uid": user["id"]})
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(400, "任务不存在、不属于你或状态不是待发布")
+    return {"ok": True, "id": task_id}
+
+
+@app.get("/publish/analytics")
+async def publish_analytics(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    """Aggregate publish metrics for dashboard."""
+    from sqlalchemy import text
+    result = await db.execute(text(
+        "SELECT status, metrics, schedule_type, platform_account_id, created_at FROM publish_tasks WHERE user_id=:uid"
+    ), {"uid": user["id"]})
+    rows = result.fetchall()
+    import json
+
+    total_plays = 0
+    total_likes = 0
+    total_comments = 0
+    total_shares = 0
+    published_count = 0
+    daily_map: dict[str, dict] = {}
+    platform_map: dict[str, dict] = {}
+    top_videos = []
+
+    for r in rows:
+        status, metrics_raw, stype, platform_id, created_at = r[0], r[1], r[2], r[3], r[4]
+        m = json.loads(metrics_raw) if metrics_raw else {}
+        plays = m.get("plays", 0) or 0
+        likes = m.get("likes", 0) or 0
+        comments = m.get("comments", 0) or 0
+        shares = m.get("shares", 0) or 0
+
+        if status == "published":
+            published_count += 1
+            total_plays += plays
+            total_likes += likes
+            total_comments += comments
+            total_shares += shares
+
+        # Daily trend (last 14 days by created_at date)
+        if created_at:
+            day = created_at[:10]  # "2026-07-14"
+            if day not in daily_map:
+                daily_map[day] = {"date": day, "publishes": 0, "plays": 0, "likes": 0}
+            daily_map[day]["publishes"] += 1
+            daily_map[day]["plays"] += plays
+            daily_map[day]["likes"] += likes
+
+        # Platform breakdown
+        if platform_id:
+            plat = platform_id[:3].upper()
+            if plat not in platform_map:
+                platform_map[plat] = {"platform": plat, "count": 0, "plays": 0, "likes": 0}
+            platform_map[plat]["count"] += 1
+            platform_map[plat]["plays"] += plays
+            platform_map[plat]["likes"] += likes
+
+        # Top videos
+        top_videos.append({
+            "task_id": r[0],
+            "plays": plays,
+            "likes": likes,
+            "comments": comments,
+            "shares": shares,
+        })
+
+    # Sort and limit
+    top_videos.sort(key=lambda x: x["plays"], reverse=True)
+    daily_trend = sorted(daily_map.values(), key=lambda x: x["date"])[-14:]
+    platform_data = list(platform_map.values())
+
+    return {
+        "summary": {
+            "total_publishes": published_count,
+            "total_plays": total_plays,
+            "total_likes": total_likes,
+            "total_comments": total_comments,
+            "total_shares": total_shares,
+            "engagement_rate": round(total_likes / total_plays * 100, 2) if total_plays > 0 else 0,
+        },
+        "daily_trend": daily_trend,
+        "platform_breakdown": platform_data,
+        "top_videos": top_videos[:10],
+    }
+
+
+@app.get("/publish/analytics/export")
+async def export_analytics(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    """Export publish analytics as CSV."""
+    from sqlalchemy import text
+    from fastapi.responses import StreamingResponse
+    import io, csv as csv_module
+
+    result = await db.execute(text(
+        "SELECT id, video_url, platform_account_id, title, status, progress, schedule_type, schedule_time, metrics, publish_result, error_message, created_at FROM publish_tasks WHERE user_id=:uid ORDER BY created_at DESC"
+    ), {"uid": user["id"]})
+    rows = result.fetchall()
+
+    output = io.StringIO()
+    writer = csv_module.writer(output)
+    writer.writerow(["任务ID", "视频URL", "平台账号", "标题", "状态", "进度", "发布方式", "排期时间",
+                      "播放量", "点赞", "评论", "分享", "发布时间", "错误信息", "创建时间"])
+
+    for r in rows:
+        m = json.loads(r[8]) if r[8] else {}
+        pub = json.loads(r[9]) if r[9] else {}
+        writer.writerow([
+            r[0][:8], r[1], r[2], r[3], r[4], r[5], r[6], r[7] or '',
+            m.get("plays", 0) or 0, m.get("likes", 0) or 0,
+            m.get("comments", 0) or 0, m.get("shares", 0) or 0,
+            pub.get("published_at", ''), r[10] or '', r[11],
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv; charset=utf-8-sig",
+        headers={"Content-Disposition": "attachment; filename=analytics_export.csv"},
+    )
 
 
 # ============ Platform ============
@@ -832,6 +1076,12 @@ async def init_db():
 if __name__ == "__main__":
     import uvicorn
     asyncio.run(init_db())
+    # Start publish scheduler in background daemon thread
+    import threading
+    def _run_scheduler():
+        asyncio.run(_publish_scheduler())
+    threading.Thread(target=_run_scheduler, daemon=True).start()
+
     print("本地服务器启动: http://localhost:8000")
     print("验证码: 8888")
     uvicorn.run(app, host="0.0.0.0", port=8000)

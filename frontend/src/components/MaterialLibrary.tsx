@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
-import { Card, Upload, Button, Tree, Table, Tag, Popconfirm, Modal, Input } from 'antd';
-import { FolderAddOutlined, DeleteOutlined, InboxOutlined } from '@ant-design/icons';
+import { Card, Upload, Button, Tree, Table, Tag, Popconfirm, Modal, Input, Select, Space, Segmented } from 'antd';
+import { FolderAddOutlined, DeleteOutlined, InboxOutlined, SearchOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
-import { listMaterials, listFolders, createFolder, deleteMaterial, uploadMaterial } from '../api/content';
+import { listMaterials, listFolders, createFolder, deleteMaterial, batchDeleteMaterials, uploadMaterial } from '../api/content';
 import { handleApiError, showSuccess } from '../utils/errorHandler';
 
 const { Dragger } = Upload;
@@ -37,18 +37,40 @@ export default function MaterialLibrary() {
   const [folderModalOpen, setFolderModalOpen] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
   const [loading, setLoading] = useState(false);
+  const [search, setSearch] = useState('');
+  const [typeFilter, setTypeFilter] = useState<string>('all');
+  const [sortBy, setSortBy] = useState('created_at');
+  const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
+
+  const handleBatchDelete = async () => {
+    try {
+      await batchDeleteMaterials(selectedRowKeys as string[]);
+      showSuccess(`已删除 ${selectedRowKeys.length} 个素材`);
+      setSelectedRowKeys([]);
+      fetchData();
+    } catch (err) { handleApiError(err, '批量删除失败'); }
+  };
 
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [matRes, folRes] = await Promise.all([listMaterials({ folder_id: selectedFolder || undefined }), listFolders()]);
+      const [matRes, folRes] = await Promise.all([
+        listMaterials({
+          folder_id: selectedFolder || undefined,
+          type: typeFilter !== 'all' ? typeFilter : undefined,
+          search: search || undefined,
+          sort_by: sortBy,
+          sort_order: 'desc',
+        }),
+        listFolders(),
+      ]);
       setMaterials(matRes.data);
       setFolders(folRes.data);
     } catch (err) { handleApiError(err, '加载素材失败'); }
     setLoading(false);
   };
 
-  useEffect(() => { fetchData(); }, [selectedFolder]);
+  useEffect(() => { fetchData(); }, [selectedFolder, typeFilter, sortBy]);
 
   const handleUpload = async (file: File) => {
     try {
@@ -79,6 +101,16 @@ export default function MaterialLibrary() {
   ];
 
   const columns: ColumnsType<Material> = [
+    { title: '预览', key: 'preview', width: 72,
+      render: (_, r) => {
+        const url = r.thumbnail_url || r.file_url;
+        const resolvedUrl = url.startsWith('http') ? url : 'http://localhost:8000' + url;
+        return r.type === 'image'
+          ? <img src={resolvedUrl} alt={r.file_name}
+              style={{ width: 56, height: 56, objectFit: 'cover', borderRadius: 4 }} />
+          : <span style={{ fontSize: 24 }}>🎬</span>;
+      }
+    },
     { title: '文件名', dataIndex: 'file_name', key: 'file_name', ellipsis: true },
     { title: '类型', dataIndex: 'type', key: 'type', width: 80,
       render: (t: string) => <Tag color={t === 'video' ? 'blue' : 'green'}>{t === 'video' ? '视频' : '图片'}</Tag> },
@@ -127,6 +159,48 @@ export default function MaterialLibrary() {
         </Card>
 
         <div style={{ flex: 1 }}>
+          <Space style={{ marginBottom: 12, width: '100%', justifyContent: 'space-between' }} size={12}>
+            <Space size={12}>
+              <Input
+                placeholder="搜索文件名或标签..."
+                prefix={<SearchOutlined />}
+                value={search}
+                onChange={e => setSearch(e.target.value)}
+                onPressEnter={fetchData}
+                onBlur={fetchData}
+                allowClear
+                style={{ width: 240 }}
+              />
+              <Segmented
+                options={[
+                  { label: '全部', value: 'all' },
+                  { label: '视频', value: 'video' },
+                  { label: '图片', value: 'image' },
+                ]}
+                value={typeFilter}
+                onChange={v => setTypeFilter(v as string)}
+              />
+            </Space>
+            <Select value={sortBy} onChange={setSortBy} style={{ width: 130 }} size="small"
+              options={[
+                { label: '最新上传', value: 'created_at' },
+                { label: '文件大小', value: 'size' },
+                { label: '文件名', value: 'file_name' },
+                { label: '时长', value: 'duration' },
+              ]} />
+          </Space>
+          {selectedRowKeys.length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <Popconfirm
+                title={`确定删除选中的 ${selectedRowKeys.length} 个素材？此操作不可恢复。`}
+                onConfirm={handleBatchDelete}
+                okText="确定删除"
+                cancelText="取消"
+              >
+                <Button danger>删除选中 ({selectedRowKeys.length})</Button>
+              </Popconfirm>
+            </div>
+          )}
           <Table
             columns={columns}
             dataSource={materials}
@@ -134,6 +208,10 @@ export default function MaterialLibrary() {
             loading={loading}
             size="small"
             locale={{ emptyText: '还没有素材，上传你的第一条视频/图片吧' }}
+            rowSelection={{
+              selectedRowKeys,
+              onChange: (keys) => setSelectedRowKeys(keys),
+            }}
           />
         </div>
       </div>

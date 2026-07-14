@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Card, Row, Col, Statistic, Button, List, Tag, Spin, Progress, Tooltip } from 'antd';
+import { Card, Row, Col, Statistic, Button, Tag, Spin, Progress, Tooltip } from 'antd';
 import { VideoCameraOutlined, UploadOutlined, ScissorOutlined, SendOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../stores/authStore';
@@ -85,7 +85,7 @@ export default function Dashboard() {
               <Tooltip title={`今日已用 ${quota.daily_edit.used} / ${quota.daily_edit.limit}`}>
                 <div style={{ textAlign: 'center' }}>
                   <div style={{ marginBottom: 4, color: '#666', fontSize: 13 }}>今日剪辑</div>
-                  <Progress type="circle" size={60} percent={Math.min(100, Math.round(quota.daily_edit.used / Math.max(1, quota.daily_edit.limit) * 100))} width={6} />
+                  <Progress type="circle" size={60} percent={Math.min(100, Math.round(quota.daily_edit.used / Math.max(1, quota.daily_edit.limit) * 100))} strokeWidth={6} />
                   <div style={{ marginTop: 4, fontSize: 12, color: '#999' }}>{quota.daily_edit.used}/{quota.daily_edit.limit}</div>
                 </div>
               </Tooltip>
@@ -94,7 +94,7 @@ export default function Dashboard() {
               <Tooltip title={`本月已用 ${quota.monthly_edit.used} / ${quota.monthly_edit.limit}`}>
                 <div style={{ textAlign: 'center' }}>
                   <div style={{ marginBottom: 4, color: '#666', fontSize: 13 }}>本月剪辑</div>
-                  <Progress type="circle" size={60} percent={Math.min(100, Math.round(quota.monthly_edit.used / Math.max(1, quota.monthly_edit.limit) * 100))} width={6} />
+                  <Progress type="circle" size={60} percent={Math.min(100, Math.round(quota.monthly_edit.used / Math.max(1, quota.monthly_edit.limit) * 100))} strokeWidth={6} />
                   <div style={{ marginTop: 4, fontSize: 12, color: '#999' }}>{quota.monthly_edit.used}/{quota.monthly_edit.limit}</div>
                 </div>
               </Tooltip>
@@ -102,7 +102,7 @@ export default function Dashboard() {
             <Col span={6}>
               <div style={{ textAlign: 'center' }}>
                 <div style={{ marginBottom: 4, color: '#666', fontSize: 13 }}>绑定账号</div>
-                <Progress type="circle" size={60} percent={Math.min(100, Math.round(quota.accounts.used / Math.max(1, quota.accounts.limit) * 100))} width={6} />
+                <Progress type="circle" size={60} percent={Math.min(100, Math.round(quota.accounts.used / Math.max(1, quota.accounts.limit) * 100))} strokeWidth={6} />
                 <div style={{ marginTop: 4, fontSize: 12, color: '#999' }}>{quota.accounts.used}/{quota.accounts.limit}</div>
               </div>
             </Col>
@@ -110,7 +110,7 @@ export default function Dashboard() {
               <Tooltip title={`存储 ${quota.storage.used_gb}GB / ${quota.storage.limit_gb}GB`}>
                 <div style={{ textAlign: 'center' }}>
                   <div style={{ marginBottom: 4, color: '#666', fontSize: 13 }}>存储空间</div>
-                  <Progress type="circle" size={60} percent={Math.min(100, Math.round(quota.storage.used / Math.max(1, quota.storage.limit) * 100))} width={6} />
+                  <Progress type="circle" size={60} percent={Math.min(100, Math.round(quota.storage.used / Math.max(1, quota.storage.limit) * 100))} strokeWidth={6} />
                   <div style={{ marginTop: 4, fontSize: 12, color: '#999' }}>{quota.storage.used_gb}/{quota.storage.limit_gb}GB</div>
                 </div>
               </Tooltip>
@@ -147,13 +147,15 @@ export default function Dashboard() {
         </Col>
         <Col span={12}>
           <Card title="最近任务">
-            <List
-              dataSource={[...editTasks, ...pubTasks].sort((a, b) =>
+            {(() => {
+              const recentTasks = [...editTasks, ...pubTasks].sort((a, b) =>
                 new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-              ).slice(0, 8)}
-              locale={{ emptyText: '暂无任务，快去创建第一条视频吧' }}
-              renderItem={(item: any) => (
-                <List.Item>
+              ).slice(0, 8);
+              if (recentTasks.length === 0) {
+                return <div style={{ color: '#999', textAlign: 'center', padding: 40 }}>暂无任务，快去创建第一条视频吧</div>;
+              }
+              return recentTasks.map((item: any) => (
+                <div key={item.id} style={{ display: 'flex', alignItems: 'center', padding: '8px 0', borderBottom: '1px solid #f0f0f0' }}>
                   <Tag color={statusColors[item.status]}>{item.status}</Tag>
                   <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {item.title || `混剪任务 ${item.id?.slice(0, 8)}`}
@@ -161,9 +163,9 @@ export default function Dashboard() {
                   <span style={{ color: '#999', fontSize: 12 }}>
                     {item.created_at ? new Date(item.created_at).toLocaleString() : ''}
                   </span>
-                </List.Item>
-              )}
-            />
+                </div>
+              ));
+            })()}
           </Card>
         </Col>
       </Row>

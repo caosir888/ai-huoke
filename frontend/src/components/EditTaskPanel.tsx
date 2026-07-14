@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Card, Table, Tag, Progress, Button, Dropdown } from 'antd';
+import { Card, Table, Tag, Progress, Button, Dropdown, Tooltip } from 'antd';
 import type { MenuProps } from 'antd';
-import { EyeOutlined, DownloadOutlined, PlusOutlined } from '@ant-design/icons';
+import { EyeOutlined, DownloadOutlined, PlusOutlined, CheckCircleOutlined, WarningOutlined, CloseCircleOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { listEditTasks } from '../api/content';
 import { handleApiError } from '../utils/errorHandler';
@@ -14,7 +14,9 @@ interface EditTask {
   status: string;
   progress: number;
   output_urls: string[];
+  thumbnail_urls: string[];
   error_message: string | null;
+  quality_report?: { unique_count: number; total_count: number; dedup_ratio: number; avg_similarity: number; passed: boolean; details?: any[] } | null;
   created_at: string;
 }
 
@@ -61,6 +63,23 @@ export default function EditTaskPanel() {
     },
     { title: '产出', dataIndex: 'output_urls', key: 'output', width: 80,
       render: (urls: string[]) => urls.length ? `${urls.length}条` : '-' },
+    { title: '去重', key: 'quality', width: 100,
+      render: (_, r) => {
+        const qr = r.quality_report;
+        if (r.status !== 'done' || !qr) return '-';
+        const score = Math.round(qr.dedup_ratio * 100);
+        const color = score >= 80 ? 'success' : score >= 60 ? 'warning' : 'error';
+        const icon = score >= 80 ? <CheckCircleOutlined /> : score >= 60 ? <WarningOutlined /> : <CloseCircleOutlined />;
+        const detail = qr.details?.length
+          ? qr.details.map((d: any) => `${d.pair[0]} ↔ ${d.pair[1]}: ${Math.round(d.similarity * 100)}%`).join('\n')
+          : '';
+        return (
+          <Tooltip title={`${qr.unique_count}/${qr.total_count} 条去重，平均相似度 ${Math.round(qr.avg_similarity * 100)}%\n${detail}`}>
+            <Tag color={color} icon={icon}>{score}分</Tag>
+          </Tooltip>
+        );
+      }
+    },
     { title: '创建时间', dataIndex: 'created_at', key: 'time', width: 160,
       render: (d: string) => new Date(d).toLocaleString() },
     { title: '操作', key: 'action', width: 220, render: (_, record) => {
@@ -74,13 +93,23 @@ export default function EditTaskPanel() {
         return null;
       }
 
-      // Build dropdown menu items for all outputs
-      const menuItems: MenuProps['items'] = urls.map((u, i) => ({
-        key: String(i),
-        label: `视频 #${i + 1}`,
-        icon: <EyeOutlined />,
-        onClick: () => { setPreviewUrl(u); setPreviewOpen(true); },
-      }));
+      // Build dropdown menu items for all outputs (with thumbnails)
+      const thumbs = record.thumbnail_urls || [];
+      const menuItems: MenuProps['items'] = urls.map((u, i) => {
+        const thumbUrl = thumbs[i] ? (thumbs[i].startsWith('http') ? thumbs[i] : 'http://localhost:8000' + thumbs[i]) : null;
+        return {
+          key: String(i),
+          label: (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              {thumbUrl
+                ? <img src={thumbUrl} style={{ width: 48, height: 27, objectFit: 'cover', borderRadius: 2 }} alt="" />
+                : <EyeOutlined />}
+              <span>视频 #{i + 1}</span>
+            </div>
+          ),
+          onClick: () => { setPreviewUrl(u); setPreviewOpen(true); },
+        };
+      });
 
       // Download handler for all
       const downloadAll = () => {

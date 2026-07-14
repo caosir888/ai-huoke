@@ -14,4 +14,7 @@ export const listPublishTasks = (status?: string) =>
 export const reschedule = (taskId: string, scheduleTime: string) =>
   api.post(`/publish/reschedule/${taskId}`, null, { params: { schedule_time: scheduleTime } });
 
+export const cancelPublishTask = (taskId: string) =>
+  api.post(`/publish/cancel/${taskId}`);
+
 export const getMetrics = (taskId: string) => api.get(`/publish/metrics/${taskId}`);

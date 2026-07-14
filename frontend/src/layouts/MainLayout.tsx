@@ -5,6 +5,7 @@ import {
   DashboardOutlined, VideoCameraOutlined, SendOutlined,
   LinkOutlined, SettingOutlined, LogoutOutlined, MenuFoldOutlined,
   MenuUnfoldOutlined, CrownOutlined, QuestionCircleOutlined,
+  BarChartOutlined,
 } from '@ant-design/icons';
 import { useAuthStore } from '../stores/authStore';
 import FeedbackButton from '../components/FeedbackButton';
@@ -15,6 +16,7 @@ const menuItems = [
   { key: '/', icon: <DashboardOutlined />, label: '工作台' },
   { key: '/content', icon: <VideoCameraOutlined />, label: '内容中心' },
   { key: '/publish', icon: <SendOutlined />, label: '发布管理' },
+  { key: '/analytics', icon: <BarChartOutlined />, label: '数据分析' },
   { key: '/accounts', icon: <LinkOutlined />, label: '账号管理' },
   { key: '/pricing', icon: <CrownOutlined />, label: '套餐升级' },
   { key: '/settings', icon: <SettingOutlined />, label: '设置' },

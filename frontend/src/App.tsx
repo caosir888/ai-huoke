@@ -7,6 +7,7 @@ import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import ContentCenter from './pages/ContentCenter';
 import PublishManagement from './pages/PublishManagement';
+import Analytics from './pages/Analytics';
 import AccountManagement from './pages/AccountManagement';
 import Settings from './pages/Settings';
 import Pricing from './pages/Pricing';
@@ -43,6 +44,7 @@ export default function App() {
             <Route index element={<Dashboard />} />
             <Route path="content" element={<ContentCenter />} />
             <Route path="publish" element={<PublishManagement />} />
+            <Route path="analytics" element={<Analytics />} />
             <Route path="accounts" element={<AccountManagement />} />
             <Route path="settings" element={<Settings />} />
             <Route path="pricing" element={<Pricing />} />
