@@ -152,6 +152,7 @@ class PlatformAccountResp(BaseModel):
     avatar: str | None
     fans_count: int
     auth_status: str
+    open_id: str | None = None
     created_at: datetime
 
     class Config:

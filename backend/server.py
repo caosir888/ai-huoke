@@ -31,6 +31,13 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 DEEPSEEK_MODEL = "deepseek-chat"
 
+# Douyin OAuth config
+DOUYIN_CLIENT_KEY = os.environ.get("DOUYIN_CLIENT_KEY", "")
+DOUYIN_CLIENT_SECRET = os.environ.get("DOUYIN_CLIENT_SECRET", "")
+DOUYIN_REDIRECT_URI = os.environ.get("DOUYIN_REDIRECT_URI", "http://localhost:8000/platform/oauth/douyin/callback")
+DOUYIN_OAUTH_SCOPE = os.environ.get("DOUYIN_OAUTH_SCOPE", "user_info")
+SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-in-production")
+
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -997,6 +1004,89 @@ async def export_analytics(user: dict = Depends(get_token_user), db: AsyncSessio
     )
 
 
+# ============ Douyin OAuth ============
+
+import hmac
+import hashlib
+
+DOUYIN_AUTH_BASE = "https://open.douyin.com"
+
+
+def _sign_state(user_id: str) -> str:
+    """Sign user_id as OAuth state parameter to prevent CSRF."""
+    payload = f"{user_id}:{uuid.uuid4().hex[:8]}"
+    sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    from base64 import urlsafe_b64encode
+    token = urlsafe_b64encode(f"{payload}:{sig}".encode()).decode()
+    return token
+
+
+def _verify_state(state: str) -> str | None:
+    """Verify OAuth state parameter and return user_id, or None if invalid."""
+    from base64 import urlsafe_b64decode
+    try:
+        decoded = urlsafe_b64decode(state.encode()).decode()
+        payload, sig = decoded.rsplit(":", 1)
+        expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        return payload.split(":")[0]  # user_id
+    except Exception:
+        return None
+
+
+def build_douyin_authorize_url(state: str) -> str:
+    """Build Douyin OAuth authorization URL."""
+    from urllib.parse import urlencode
+    params = {
+        "client_key": DOUYIN_CLIENT_KEY,
+        "response_type": "code",
+        "scope": DOUYIN_OAUTH_SCOPE,
+        "redirect_uri": DOUYIN_REDIRECT_URI,
+        "state": state,
+    }
+    return f"{DOUYIN_AUTH_BASE}/platform/oauth/connect/?{urlencode(params)}"
+
+
+async def douyin_exchange_code(code: str) -> dict:
+    """Exchange authorization code for access token. Returns token data dict."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            f"{DOUYIN_AUTH_BASE}/oauth/access_token/",
+            json={
+                "client_key": DOUYIN_CLIENT_KEY,
+                "client_secret": DOUYIN_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+            },
+        )
+        return resp.json()
+
+
+async def douyin_refresh_token(refresh_token: str) -> dict:
+    """Refresh an expired access token."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            f"{DOUYIN_AUTH_BASE}/oauth/refresh_token/",
+            json={
+                "client_key": DOUYIN_CLIENT_KEY,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+        )
+        return resp.json()
+
+
+async def douyin_get_user_info(access_token: str, open_id: str) -> dict:
+    """Get Douyin user profile info."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"{DOUYIN_AUTH_BASE}/oauth/userinfo/",
+            headers={"access-token": access_token},
+            params={"open_id": open_id},
+        )
+        return resp.json()
+
 # ============ Platform ============
 
 class BindAccountReq(BaseModel):
@@ -1006,17 +1096,19 @@ class BindAccountReq(BaseModel):
 @app.get("/platform/accounts")
 async def list_accounts(user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
-    result = await db.execute(text("SELECT id, platform, account_name, avatar, fans_count, auth_status, created_at FROM platform_accounts WHERE user_id = :uid"), {"uid": user["id"]})
+    result = await db.execute(text("SELECT id, platform, account_name, avatar, fans_count, auth_status, open_id, created_at FROM platform_accounts WHERE user_id = :uid"), {"uid": user["id"]})
     rows = result.fetchall()
-    return [{"id": r[0], "platform": r[1], "account_name": r[2], "avatar": r[3], "fans_count": r[4], "auth_status": r[5], "created_at": r[6]} for r in rows]
+    return [{"id": r[0], "platform": r[1], "account_name": r[2], "avatar": r[3], "fans_count": r[4], "auth_status": r[5], "open_id": r[6], "created_at": r[7]} for r in rows]
 
 @app.post("/platform/accounts/bind")
 async def bind_account(req: BindAccountReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    """Bind a platform account. For Douyin, use OAuth flow instead (GET /platform/oauth/douyin/authorize)."""
     from sqlalchemy import text
     aid = str(uuid.uuid4())
     now = now_cst().isoformat()
     await db.execute(text(
-        "INSERT INTO platform_accounts (id, user_id, platform, account_name, auth_token, auth_status, created_at) VALUES (:id, :uid, :platform, :name, :token, 'active', :now)"
+        "INSERT INTO platform_accounts (id, user_id, platform, account_name, auth_token, refresh_token, open_id, scope, auth_status, created_at) "
+        "VALUES (:id, :uid, :platform, :name, :token, '', '', '', 'active', :now)"
     ), {"id": aid, "uid": user["id"], "platform": req.platform, "name": f"{req.platform}_account", "token": req.auth_token, "now": now})
     await db.commit()
     return {"id": aid, "platform": req.platform, "account_name": f"{req.platform}_account", "avatar": None, "fans_count": 0, "auth_status": "active", "created_at": now}
@@ -1027,6 +1119,87 @@ async def unbind_account(account_id: str, user: dict = Depends(get_token_user), 
     await db.execute(text("DELETE FROM platform_accounts WHERE id = :id AND user_id = :uid"), {"id": account_id, "uid": user["id"]})
     await db.commit()
     return {"message": "已解绑"}
+
+
+@app.get("/platform/oauth/douyin/authorize")
+async def douyin_authorize(user: dict = Depends(get_token_user)):
+    """Get Douyin OAuth authorization URL."""
+    if not DOUYIN_CLIENT_KEY:
+        raise HTTPException(status_code=500, detail="抖音开放平台未配置（缺少 DOUYIN_CLIENT_KEY）")
+    state = _sign_state(user["id"])
+    url = build_douyin_authorize_url(state)
+    return {"authorize_url": url, "state": state}
+
+
+@app.get("/platform/oauth/douyin/callback")
+async def douyin_callback(code: str, state: str, db: AsyncSession = Depends(get_db)):
+    """Handle Douyin OAuth callback. Exchanges code for token and stores account."""
+    from sqlalchemy import text
+    from fastapi.responses import RedirectResponse
+
+    # Verify state
+    user_id = _verify_state(state)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Invalid state parameter")
+
+    # Exchange code for access token
+    token_data = await douyin_exchange_code(code)
+    if "data" not in token_data or "access_token" not in token_data.get("data", {}):
+        error_msg = token_data.get("data", {}).get("description", token_data.get("data", {}).get("error_description", "Unknown error"))
+        raise HTTPException(status_code=400, detail=f"Token exchange failed: {error_msg}")
+
+    data = token_data["data"]
+    access_token = data["access_token"]
+    refresh_token = data.get("refresh_token", "")
+    open_id = data.get("open_id", "")
+    scope = data.get("scope", "")
+    expires_in = data.get("expires_in", 1296000)  # 15 days default
+
+    # Calculate expiry
+    expires_at = (now_cst() + timedelta(seconds=expires_in)).isoformat()
+
+    # Get user info
+    account_name = f"douyin_{user_id[:8]}"
+    avatar = None
+    try:
+        user_info = await douyin_get_user_info(access_token, open_id)
+        if "data" in user_info:
+            info = user_info["data"]
+            account_name = info.get("nickname", account_name)
+            avatar = info.get("avatar", None)
+    except Exception:
+        pass  # user info fetch is best-effort
+
+    # Upsert: update if same open_id already exists, otherwise insert
+    existing = await db.execute(text(
+        "SELECT id FROM platform_accounts WHERE user_id = :uid AND platform = :platform AND open_id = :open_id"
+    ), {"uid": user_id, "platform": "douyin", "open_id": open_id})
+    existing_row = existing.fetchone()
+    now = now_cst().isoformat()
+
+    if existing_row:
+        await db.execute(text(
+            "UPDATE platform_accounts SET auth_token=:token, refresh_token=:rt, scope=:scope, "
+            "expires_at=:exp, account_name=:name, avatar=:av, auth_status='active', fans_count=:fans "
+            "WHERE id=:id"
+        ), {"token": access_token, "rt": refresh_token, "scope": scope,
+            "exp": expires_at, "name": account_name, "av": avatar,
+            "fans": 0, "id": existing_row[0]})
+    else:
+        aid = str(uuid.uuid4())
+        await db.execute(text(
+            "INSERT INTO platform_accounts (id, user_id, platform, account_name, avatar, fans_count, "
+            "auth_token, refresh_token, open_id, scope, auth_status, expired_at, created_at) "
+            "VALUES (:id, :uid, :platform, :name, :av, :fans, :token, :rt, :open_id, :scope, 'active', :exp, :now)"
+        ), {"id": aid, "uid": user_id, "platform": "douyin", "name": account_name,
+            "av": avatar, "fans": 0, "token": access_token, "rt": refresh_token,
+            "open_id": open_id, "scope": scope, "exp": expires_at, "now": now})
+
+    await db.commit()
+
+    # Redirect to frontend with success
+    frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+    return RedirectResponse(url=f"{frontend_url}/accounts?bind_status=success&platform=douyin")
 
 # ============ Payment ============
 
@@ -1636,8 +1809,15 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS platform_accounts (
             id TEXT PRIMARY KEY, user_id TEXT, platform TEXT, account_name TEXT,
             avatar TEXT, fans_count INTEGER DEFAULT 0, auth_token TEXT,
+            refresh_token TEXT, open_id TEXT, scope TEXT,
             auth_status TEXT DEFAULT 'pending', expired_at TEXT, created_at TEXT
         )"""))
+        # Migrate: add new OAuth columns if missing (for existing DBs)
+        for col, col_type in [("open_id", "TEXT"), ("refresh_token", "TEXT"), ("scope", "TEXT")]:
+            try:
+                await conn.execute(text(f"ALTER TABLE platform_accounts ADD COLUMN {col} {col_type}"))
+            except Exception:
+                pass  # column already exists
         await conn.execute(text("""
         CREATE TABLE IF NOT EXISTS material_folders (
             id TEXT PRIMARY KEY, user_id TEXT, name TEXT, parent_id TEXT, created_at TEXT

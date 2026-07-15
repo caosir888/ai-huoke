@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
     ALIYUN_ACCESS_KEY: str = ""
     ALIYUN_SECRET_KEY: str = ""
+    DOUYIN_CLIENT_KEY: str = ""
+    DOUYIN_CLIENT_SECRET: str = ""
+    DOUYIN_REDIRECT_URI: str = "http://localhost:8000/platform/oauth/douyin/callback"
+    DOUYIN_OAUTH_SCOPE: str = "user_info"
+    FRONTEND_URL: str = "http://localhost:5173"
 
     class Config:
         env_file = ".env"

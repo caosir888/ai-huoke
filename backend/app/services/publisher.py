@@ -2,9 +2,11 @@
 Publisher: handles video publishing to platforms with API+RPA dual routing.
 """
 import httpx
-import json
+from datetime import datetime, timezone
 from typing import Optional
 from enum import Enum
+
+from app.services.oauth_service import douyin_refresh_token
 
 
 class PublishMode(Enum):
@@ -30,6 +32,29 @@ class Publisher:
             },
         }
 
+    async def _refresh_if_needed(self, account) -> str | None:
+        """Refresh access token if expired. Returns new token, or None on failure."""
+        if not account.expired_at or not account.refresh_token:
+            return account.auth_token
+
+        now = datetime.now(timezone.utc)
+        if account.expired_at.tzinfo is None:
+            account.expired_at = account.expired_at.replace(tzinfo=timezone.utc)
+
+        if now < account.expired_at:
+            return account.auth_token
+
+        token_data = await douyin_refresh_token(account.refresh_token)
+        new_token = token_data.get("data", {}).get("access_token")
+        if new_token:
+            account.auth_token = new_token
+            new_refresh = token_data["data"].get("refresh_token")
+            if new_refresh:
+                account.refresh_token = new_refresh
+            expires_in = token_data["data"].get("expires_in", 1296000)
+            account.expired_at = now + __import__("datetime").timedelta(seconds=expires_in)
+        return new_token
+
     async def publish_to_douyin_via_api(
         self, access_token: str, video_path: str, title: str
     ) -> dict:
@@ -42,7 +67,7 @@ class Publisher:
             init_resp = await client.post(
                 "https://open.douyin.com/video/upload/init/",
                 headers=headers,
-                json={"video_size": 0},  # Will use real file size in production
+                json={"video_size": 0},
             )
             init_data = init_resp.json()
 
@@ -68,8 +93,6 @@ class Publisher:
         self, platform: str, account_id: str, video_path: str, title: str
     ) -> dict:
         """Publish via RPA (Playwright-based). This is a backup when API is unavailable."""
-        # In production: send task to RPA service to execute Playwright script
-        # For now: stub that records the intent
         return {
             "mode": "rpa",
             "status": "queued",
@@ -87,7 +110,6 @@ class Publisher:
         title: str,
     ) -> dict:
         """Publish with automatic API/RPA routing."""
-        # Try API first
         if platform == "douyin" and access_token:
             try:
                 result = await self.publish_to_douyin_via_api(
@@ -95,11 +117,9 @@ class Publisher:
                 )
                 if result.get("data"):
                     return {"mode": "api", "status": "published", "data": result["data"]}
-            except Exception as e:
-                # API failed, fall through to RPA
+            except Exception:
                 pass
 
-        # Fallback to RPA
         return await self.publish_via_rpa(platform, account_id, video_path, title)
 
     async def get_video_metrics(

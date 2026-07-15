@@ -6,3 +6,5 @@ export const bindAccount = (platform: string, authToken: string) =>
 export const listAccounts = () => api.get('/platform/accounts');
 
 export const unbindAccount = (id: string) => api.delete(`/platform/accounts/${id}`);
+
+export const getDouyinAuthUrl = () => api.get('/platform/oauth/douyin/authorize');
