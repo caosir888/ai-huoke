@@ -2,16 +2,8 @@
 Publisher: handles video publishing to platforms with API+RPA dual routing.
 """
 import httpx
-from datetime import datetime, timezone
-from typing import Optional
-from enum import Enum
-
+from datetime import datetime, timedelta, timezone
 from app.services.oauth_service import douyin_refresh_token
-
-
-class PublishMode(Enum):
-    API = "api"
-    RPA = "rpa"
 
 
 class Publisher:
@@ -52,7 +44,7 @@ class Publisher:
             if new_refresh:
                 account.refresh_token = new_refresh
             expires_in = token_data["data"].get("expires_in", 1296000)
-            account.expired_at = now + __import__("datetime").timedelta(seconds=expires_in)
+            account.expired_at = now + timedelta(seconds=expires_in)
         return new_token
 
     async def publish_to_douyin_via_api(
@@ -105,11 +97,13 @@ class Publisher:
         self,
         platform: str,
         account_id: str,
-        access_token: str,
+        account,  # PlatformAccount
         video_path: str,
         title: str,
     ) -> dict:
-        """Publish with automatic API/RPA routing."""
+        """Publish with automatic API/RPA routing and token refresh."""
+        access_token = await self._refresh_if_needed(account)
+
         if platform == "douyin" and access_token:
             try:
                 result = await self.publish_to_douyin_via_api(

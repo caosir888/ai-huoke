@@ -116,7 +116,7 @@ def check_scheduled_publishes():
                     result = await publisher.publish(
                         platform=account.platform,
                         account_id=str(account.id),
-                        access_token=account.auth_token or "",
+                        account=account,
                         video_path=task.video_url,
                         title=task.title,
                     )

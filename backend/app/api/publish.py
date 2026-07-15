@@ -60,7 +60,7 @@ async def create_publish_task(
             result = await publisher.publish(
                 platform=account.platform,
                 account_id=str(account.id),
-                access_token=account.auth_token or "",
+                account=account,
                 video_path=req.video_url,
                 title=req.title,
             )

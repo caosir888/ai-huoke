@@ -35,7 +35,7 @@ DEEPSEEK_MODEL = "deepseek-chat"
 DOUYIN_CLIENT_KEY = os.environ.get("DOUYIN_CLIENT_KEY", "")
 DOUYIN_CLIENT_SECRET = os.environ.get("DOUYIN_CLIENT_SECRET", "")
 DOUYIN_REDIRECT_URI = os.environ.get("DOUYIN_REDIRECT_URI", "http://localhost:8000/platform/oauth/douyin/callback")
-DOUYIN_OAUTH_SCOPE = os.environ.get("DOUYIN_OAUTH_SCOPE", "user_info")
+DOUYIN_OAUTH_SCOPE = os.environ.get("DOUYIN_OAUTH_SCOPE", "user_info,video.create,video.data")
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-in-production")
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
@@ -1180,7 +1180,7 @@ async def douyin_callback(code: str, state: str, db: AsyncSession = Depends(get_
     if existing_row:
         await db.execute(text(
             "UPDATE platform_accounts SET auth_token=:token, refresh_token=:rt, scope=:scope, "
-            "expires_at=:exp, account_name=:name, avatar=:av, auth_status='active', fans_count=:fans "
+            "expired_at=:exp, account_name=:name, avatar=:av, auth_status='active', fans_count=:fans "
             "WHERE id=:id"
         ), {"token": access_token, "rt": refresh_token, "scope": scope,
             "exp": expires_at, "name": account_name, "av": avatar,
