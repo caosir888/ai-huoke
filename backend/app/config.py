@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     DOUYIN_CLIENT_KEY: str = ""
     DOUYIN_CLIENT_SECRET: str = ""
     DOUYIN_REDIRECT_URI: str = "http://localhost:8000/platform/oauth/douyin/callback"
-    DOUYIN_OAUTH_SCOPE: str = "user_info,video.create,video.data"
+    DOUYIN_OAUTH_SCOPE: str = "user_info,video.create.bind,video.data"
     FRONTEND_URL: str = "http://localhost:5173"
 
     class Config:

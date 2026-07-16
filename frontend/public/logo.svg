@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1677ff"/>
+      <stop offset="100%" style="stop-color:#722ed1"/>
+    </linearGradient>
+    <linearGradient id="dot" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#ff4d4f"/>
+      <stop offset="100%" style="stop-color:#fa8c16"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background rounded square -->
+  <rect x="10" y="10" width="180" height="180" rx="36" ry="36" fill="url(#bg)"/>
+
+  <!-- AI sparkle/brain icon -->
+  <!-- Central diamond/shape -->
+  <polygon points="100,45 140,95 100,145 60,95" fill="none" stroke="white" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Inner connection lines -->
+  <line x1="100" y1="65" x2="100" y2="125" stroke="white" stroke-width="3" stroke-linecap="round"/>
+  <line x1="78" y1="95" x2="122" y2="95" stroke="white" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Top sparkle -->
+  <circle cx="100" cy="45" r="4" fill="white"/>
+  <!-- Left sparkle -->
+  <circle cx="62" cy="95" r="3.5" fill="white"/>
+  <!-- Right sparkle -->
+  <circle cx="138" cy="95" r="3.5" fill="white"/>
+  <!-- Bottom sparkle -->
+  <circle cx="100" cy="145" r="4" fill="white"/>
+
+  <!-- Small decorative dot - target/marketing -->
+  <circle cx="152" cy="58" r="8" fill="url(#dot)" opacity="0.9"/>
+  <circle cx="152" cy="58" r="4" fill="white" opacity="0.8"/>
+</svg>

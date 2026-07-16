@@ -35,7 +35,7 @@ DEEPSEEK_MODEL = "deepseek-chat"
 DOUYIN_CLIENT_KEY = os.environ.get("DOUYIN_CLIENT_KEY", "")
 DOUYIN_CLIENT_SECRET = os.environ.get("DOUYIN_CLIENT_SECRET", "")
 DOUYIN_REDIRECT_URI = os.environ.get("DOUYIN_REDIRECT_URI", "http://localhost:8000/platform/oauth/douyin/callback")
-DOUYIN_OAUTH_SCOPE = os.environ.get("DOUYIN_OAUTH_SCOPE", "user_info,video.create,video.data,video.comment")
+DOUYIN_OAUTH_SCOPE = os.environ.get("DOUYIN_OAUTH_SCOPE", "user_info,video.create.bind,video.data,video.comment")
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-in-production")
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
@@ -801,25 +801,32 @@ async def _try_real_publish(task_id: str, user_id: str, db) -> bool:
     """Attempt real Douyin publish. Returns True if successful, False if should fallback to simulation."""
     from sqlalchemy import text as sql_text
 
+    print(f"[PUBLISH] === Starting _try_real_publish for task {task_id[:8]} ===")
+
     # Look up the publish task's platform_account_id
     task_row = (await db.execute(sql_text(
         "SELECT platform_account_id, video_url, title FROM publish_tasks WHERE id=:id"
     ), {"id": task_id})).fetchone()
     if not task_row:
+        print("[PUBLISH] Task not found, fallback to simulation")
         return False
 
     account_id, video_url, title = task_row[0], task_row[1], task_row[2]
+    print(f"[PUBLISH] account_id={account_id[:8]}... video_url={video_url[:60]}... title={title}")
 
     # Look up the platform account
     acct_row = (await db.execute(sql_text(
         "SELECT platform, auth_token, refresh_token, open_id, expired_at FROM platform_accounts WHERE id=:id"
     ), {"id": account_id})).fetchone()
     if not acct_row:
+        print(f"[PUBLISH] Platform account {account_id[:8]}... not found, fallback to simulation")
         return False
 
     platform, auth_token, refresh_token, open_id, expired_at = acct_row
+    print(f"[PUBLISH] platform={platform} has_token={bool(auth_token)} has_open_id={bool(open_id)}")
 
     if platform != "douyin" or not auth_token or not open_id:
+        print(f"[PUBLISH] Not douyin or missing credentials, fallback to simulation")
         return False
 
     # Check token expiry and refresh if needed
@@ -841,9 +848,18 @@ async def _try_real_publish(task_id: str, user_id: str, db) -> bool:
                     ), {"t": new_token, "r": new_refresh or refresh_token, "e": new_exp, "id": account_id})
                     await db.commit()
                 else:
-                    return False
-        except Exception:
-            return False
+                    err_desc = token_data.get("data", {}).get("description", "token refresh returned no access_token")
+                    await db.execute(sql_text(
+                        "UPDATE publish_tasks SET status='failed', error_message=:msg WHERE id=:id"
+                    ), {"msg": f"Token刷新失败: {err_desc}", "id": task_id})
+                    await db.commit()
+                    return True
+        except Exception as e:
+            await db.execute(sql_text(
+                "UPDATE publish_tasks SET status='failed', error_message=:msg WHERE id=:id"
+            ), {"msg": f"Token刷新异常: {str(e)}", "id": task_id})
+            await db.commit()
+            return True
 
     # Step 1: Upload video
     try:
@@ -853,12 +869,29 @@ async def _try_real_publish(task_id: str, user_id: str, db) -> bool:
         await db.commit()
 
         video_path = video_url
-        # If video_url is a local path, use it directly; otherwise skip real publish
+        # Resolve localhost URLs to local paths
+        if video_path.startswith("http://localhost:8000/"):
+            video_path = video_path.replace("http://localhost:8000", "")
+        elif video_path.startswith("http://127.0.0.1:8000/"):
+            video_path = video_path.replace("http://127.0.0.1:8000", "")
+
+        # Ensure path starts with / and file exists
+        if not video_path.startswith("/"):
+            video_path = "/" + video_path
+        video_path = os.path.abspath("." + video_path) if video_path.startswith("/") else video_path
+
+        print(f"[PUBLISH] Resolved video path: {video_path}")
         if not os.path.exists(video_path):
-            return False
+            print(f"[PUBLISH] Video file NOT FOUND at {video_path}")
+            await db.execute(sql_text(
+                "UPDATE publish_tasks SET status='failed', error_message=:msg WHERE id=:id"
+            ), {"msg": f"视频文件不存在: {video_path}", "id": task_id})
+            await db.commit()
+            return True
 
         file_size = os.path.getsize(video_path)
         file_name = Path(video_path).name
+        print(f"[PUBLISH] Video file found: {file_name} ({file_size} bytes), uploading to Douyin...")
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             with open(video_path, "rb") as f:
@@ -870,7 +903,9 @@ async def _try_real_publish(task_id: str, user_id: str, db) -> bool:
                 )
             upload_result = upload_resp.json()
 
+        print(f"[PUBLISH] Upload response status={upload_resp.status_code}, body keys={list(upload_result.keys())}")
         upload_data = upload_result.get("data", {})
+        print(f"[PUBLISH] Upload data: {json.dumps(upload_data, ensure_ascii=False)[:300]}")
         if not upload_data or upload_data.get("error_code", -1) != 0:
             err = upload_data.get("description", upload_result.get("err_msg", "upload failed"))
             await db.execute(sql_text(
@@ -907,9 +942,12 @@ async def _try_real_publish(task_id: str, user_id: str, db) -> bool:
             )
             create_result = create_resp.json()
 
+        print(f"[PUBLISH] Create response status={create_resp.status_code}, body keys={list(create_result.keys())}")
         create_data = create_result.get("data", {})
+        print(f"[PUBLISH] Create data: {json.dumps(create_data, ensure_ascii=False)[:300]}")
         if create_data.get("error_code", -1) != 0:
             err = create_data.get("description", create_result.get("err_msg", "create failed"))
+            print(f"[PUBLISH] Create FAILED: {err}")
             await db.execute(sql_text(
                 "UPDATE publish_tasks SET status='failed', error_message=:msg WHERE id=:id"
             ), {"msg": f"发布失败: {err}", "id": task_id})
@@ -917,6 +955,7 @@ async def _try_real_publish(task_id: str, user_id: str, db) -> bool:
             return True
 
         item_id = create_data.get("item_id", "")
+        print(f"[PUBLISH] === SUCCESS! item_id={item_id} ===")
         publish_result = {
             "platform_post_id": item_id,
             "video_id": video_id,
@@ -932,6 +971,7 @@ async def _try_real_publish(task_id: str, user_id: str, db) -> bool:
         return True
 
     except Exception as e:
+        print(f"[PUBLISH] EXCEPTION: {type(e).__name__}: {e}")
         await db.execute(sql_text(
             "UPDATE publish_tasks SET status='failed', error_message=:msg WHERE id=:id"
         ), {"msg": f"发布异常: {str(e)}", "id": task_id})
