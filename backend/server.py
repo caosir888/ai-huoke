@@ -1082,10 +1082,11 @@ async def douyin_get_user_info(access_token: str, open_id: str) -> dict:
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(
             f"{DOUYIN_AUTH_BASE}/oauth/userinfo/",
-            headers={"access-token": access_token},
-            params={"open_id": open_id},
+            params={"access_token": access_token, "open_id": open_id},
         )
-        return resp.json()
+        result = resp.json()
+        print(f"[UserInfo-DEBUG] token={access_token[:20]}... open_id={open_id} response={result}")
+        return result
 
 # ============ Platform ============
 
@@ -1132,21 +1133,38 @@ async def douyin_authorize(user: dict = Depends(get_token_user)):
 
 
 @app.get("/platform/oauth/douyin/callback")
-async def douyin_callback(code: str, state: str, db: AsyncSession = Depends(get_db)):
+async def douyin_callback(code: str, state: str = "", db: AsyncSession = Depends(get_db), scopes: str = ""):
     """Handle Douyin OAuth callback. Exchanges code for token and stores account."""
     from sqlalchemy import text
     from fastapi.responses import RedirectResponse
+    from urllib.parse import urlencode
+
+    frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 
     # Verify state
     user_id = _verify_state(state)
     if not user_id:
-        raise HTTPException(status_code=400, detail="Invalid state parameter")
+        qs = urlencode({"bind_status": "error", "error": "授权验证失败，请重试"})
+        return RedirectResponse(url=f"{frontend_url}/oauth/callback?{qs}")
+
+    # trial.whitelist ONLY flow (no other scopes): just exchange code to complete binding, don't store account
+    is_whitelist_only = scopes.strip() == "trial.whitelist"
+    if is_whitelist_only:
+        token_data = await douyin_exchange_code(code)
+        if "data" in token_data and "access_token" in token_data["data"]:
+            return RedirectResponse(url=f"{frontend_url}/oauth/callback?bind_status=success&platform=douyin&whitelist=1")
+        else:
+            error_msg = token_data.get("data", {}).get("description", "token exchange failed")
+            qs = urlencode({"bind_status": "error", "error": error_msg})
+            return RedirectResponse(url=f"{frontend_url}/oauth/callback?{qs}")
 
     # Exchange code for access token
     token_data = await douyin_exchange_code(code)
+    print(f"[OAuth-DEBUG] token exchange response: {token_data}")
     if "data" not in token_data or "access_token" not in token_data.get("data", {}):
         error_msg = token_data.get("data", {}).get("description", token_data.get("data", {}).get("error_description", "Unknown error"))
-        raise HTTPException(status_code=400, detail=f"Token exchange failed: {error_msg}")
+        qs = urlencode({"bind_status": "error", "error": error_msg})
+        return RedirectResponse(url=f"{frontend_url}/oauth/callback?{qs}")
 
     data = token_data["data"]
     access_token = data["access_token"]
@@ -1197,9 +1215,7 @@ async def douyin_callback(code: str, state: str, db: AsyncSession = Depends(get_
 
     await db.commit()
 
-    # Redirect to frontend with success
-    frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:5173")
-    return RedirectResponse(url=f"{frontend_url}/accounts?bind_status=success&platform=douyin")
+    return RedirectResponse(url=f"{frontend_url}/oauth/callback?bind_status=success&platform=douyin")
 
 # ============ Payment ============
 

@@ -6,8 +6,6 @@ import api from '../api/client';
 
 const { Title, Paragraph } = Typography;
 
-const fieldLabels: Record<string, string> = { name: '姓名', phone: '手机号', company: '公司', message: '留言' };
-
 export default function PublicForm() {
   const { shareCode } = useParams();
   const [formInfo, setFormInfo] = useState<any>(null);

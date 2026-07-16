@@ -54,7 +54,6 @@ export default function PublishManagement() {
   };
 
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const [tick, setTick] = useState(0); // forces countdown re-render every second
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -68,10 +67,9 @@ export default function PublishManagement() {
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
-  // Auto-poll when any task is publishing; also tick countdown every second
+  // Auto-poll when any task is publishing
   useEffect(() => {
     const hasActive = tasks.some(t => t.status === 'publishing');
-    const hasPendingTimed = tasks.some(t => t.status === 'pending' && t.schedule_type === 'timed');
 
     if (hasActive && !pollingRef.current) {
       pollingRef.current = setInterval(fetchData, 2000);
@@ -80,11 +78,6 @@ export default function PublishManagement() {
       pollingRef.current = null;
     }
 
-    // Tick every 1s for countdown display when there are pending timed tasks
-    if (hasPendingTimed) {
-      const timer = setInterval(() => setTick(t => t + 1), 1000);
-      return () => { clearInterval(timer); };
-    }
     return () => {
       if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
     };

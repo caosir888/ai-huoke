@@ -90,7 +90,6 @@ async def douyin_get_user_info(access_token: str, open_id: str) -> dict:
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(
             f"{DOUYIN_AUTH_BASE}/oauth/userinfo/",
-            headers={"access-token": access_token},
-            params={"open_id": open_id},
+            params={"access_token": access_token, "open_id": open_id},
         )
         return resp.json()

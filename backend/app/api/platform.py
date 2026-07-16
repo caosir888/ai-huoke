@@ -72,17 +72,32 @@ async def douyin_authorize(user: User = Depends(get_current_user)):
 
 
 @router.get("/oauth/douyin/callback")
-async def douyin_callback(code: str, state: str, db: AsyncSession = Depends(get_db)):
+async def douyin_callback(code: str, state: str = "", db: AsyncSession = Depends(get_db), scopes: str = ""):
     """Handle Douyin OAuth callback."""
+    from urllib.parse import urlencode
+
+    # Verify state
     user_id = verify_state(state)
     if not user_id:
-        raise HTTPException(status_code=400, detail="Invalid state parameter")
+        qs = urlencode({"bind_status": "error", "error": "授权验证失败，请重试"})
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}/oauth/callback?{qs}")
+
+    # trial.whitelist ONLY flow (no other scopes): just exchange code to complete binding, don't store account
+    if scopes.strip() == "trial.whitelist":
+        token_data = await douyin_exchange_code(code)
+        if "data" in token_data and "access_token" in token_data["data"]:
+            return RedirectResponse(url=f"{settings.FRONTEND_URL}/oauth/callback?bind_status=success&platform=douyin&whitelist=1")
+        else:
+            error_msg = token_data.get("data", {}).get("description", "token exchange failed")
+            qs = urlencode({"bind_status": "error", "error": error_msg})
+            return RedirectResponse(url=f"{settings.FRONTEND_URL}/oauth/callback?{qs}")
 
     token_data = await douyin_exchange_code(code)
     data = token_data.get("data", {})
     if "access_token" not in data:
         error_msg = data.get("description", data.get("error_description", "Unknown error"))
-        raise HTTPException(status_code=400, detail=f"Token exchange failed: {error_msg}")
+        qs = urlencode({"bind_status": "error", "error": error_msg})
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}/oauth/callback?{qs}")
 
     access_token = data["access_token"]
     refresh_token = data.get("refresh_token", "")
@@ -131,7 +146,7 @@ async def douyin_callback(code: str, state: str, db: AsyncSession = Depends(get_
         db.add(account)
 
     await db.commit()
-    return RedirectResponse(url=f"{settings.FRONTEND_URL}/accounts?bind_status=success&platform=douyin")
+    return RedirectResponse(url=f"{settings.FRONTEND_URL}/oauth/callback?bind_status=success&platform=douyin")
 
 
 @router.get("/accounts", response_model=list[PlatformAccountResp])

@@ -41,14 +41,19 @@ export default function AccountManagement() {
   useEffect(() => {
     fetchAccounts();
 
-    // Handle OAuth callback redirect
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('bind_status') === 'success') {
-      const platform = params.get('platform');
-      showSuccess(`${platformNames[platform || 'douyin'] || '平台'}账号授权成功`);
-      // Clean URL
-      window.history.replaceState({}, '', '/accounts');
-    }
+    // Handle OAuth callback via postMessage from popup
+    const handleMessage = (e: MessageEvent) => {
+      if (e.data?.type !== 'oauth_callback') return;
+      if (e.data.status === 'success') {
+        const platform = e.data.platform || 'douyin';
+        showSuccess(`${platformNames[platform] || '平台'}账号授权成功`);
+        fetchAccounts();
+      } else if (e.data.status === 'error') {
+        message.error(e.data.error || '授权失败');
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
   }, []);
 
   const handleDouyinOAuth = async () => {

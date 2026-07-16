@@ -153,6 +153,24 @@ def list_accounts(authorization: str | None = None):
 def bind_account(req: dict, authorization: str | None = None):
     return {"id": str(uuid.uuid4()), "platform": req.get("platform", "douyin"), "account_name": f"{req.get('platform')}_account", "avatar": None, "fans_count": 0, "auth_status": "active", "created_at": datetime.utcnow().isoformat()}
 
+# ============ OAuth (Mock) ============
+
+@app.get("/platform/oauth/douyin/authorize")
+def douyin_authorize(authorization: str | None = None):
+    """Mock Douyin OAuth authorize — returns a simulated authorization URL."""
+    user = get_user_from_token(authorization)
+    if not user:
+        return {"detail": "Invalid token"}, 401
+    state = f"mock_state_{uuid.uuid4().hex[:16]}"
+    authorize_url = f"http://localhost:8000/platform/oauth/douyin/callback?code=mock_code_{uuid.uuid4().hex}&state={state}"
+    return {"authorize_url": authorize_url, "state": state}
+
+@app.get("/platform/oauth/douyin/callback")
+def douyin_callback(code: str, state: str):
+    """Mock Douyin OAuth callback — simulates successful authorization."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=f"http://localhost:5173/oauth/callback?bind_status=success&platform=douyin")
+
 # ============ Payment ============
 
 @app.get("/payment/plans")

@@ -15,6 +15,7 @@ import Help from './pages/Help';
 import AdminUsers from './pages/AdminUsers';
 import LeadManagement from './pages/LeadManagement';
 import PublicForm from './pages/PublicForm';
+import OAuthCallback from './pages/OAuthCallback';
 import ErrorBoundary from './components/ErrorBoundary';
 import { useAuthStore } from './stores/authStore';
 
@@ -56,6 +57,7 @@ export default function App() {
             <Route path="leads" element={<LeadManagement />} />
           </Route>
           <Route path="/form/:shareCode" element={<PublicForm />} />
+          <Route path="/oauth/callback" element={<OAuthCallback />} />
           <Route path="*" element={<Navigate to="/" />} />
         </Routes>
       </BrowserRouter>

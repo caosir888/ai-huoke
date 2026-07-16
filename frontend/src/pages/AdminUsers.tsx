@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react';
 import { Card, Table, Tag, Spin } from 'antd';
-import { TeamOutlined } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import api from '../api/client';
 
