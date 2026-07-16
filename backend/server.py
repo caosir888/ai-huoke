@@ -35,7 +35,7 @@ DEEPSEEK_MODEL = "deepseek-chat"
 DOUYIN_CLIENT_KEY = os.environ.get("DOUYIN_CLIENT_KEY", "")
 DOUYIN_CLIENT_SECRET = os.environ.get("DOUYIN_CLIENT_SECRET", "")
 DOUYIN_REDIRECT_URI = os.environ.get("DOUYIN_REDIRECT_URI", "http://localhost:8000/platform/oauth/douyin/callback")
-DOUYIN_OAUTH_SCOPE = os.environ.get("DOUYIN_OAUTH_SCOPE", "user_info,video.create,video.data")
+DOUYIN_OAUTH_SCOPE = os.environ.get("DOUYIN_OAUTH_SCOPE", "user_info,video.create,video.data,video.comment")
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-in-production")
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
@@ -797,6 +797,148 @@ async def create_publish_task(req: CreatePublishTaskReq, user: dict = Depends(ge
             "status": initial_status, "publish_result": None, "metrics": {}, "created_at": now}
 
 
+async def _try_real_publish(task_id: str, user_id: str, db) -> bool:
+    """Attempt real Douyin publish. Returns True if successful, False if should fallback to simulation."""
+    from sqlalchemy import text as sql_text
+
+    # Look up the publish task's platform_account_id
+    task_row = (await db.execute(sql_text(
+        "SELECT platform_account_id, video_url, title FROM publish_tasks WHERE id=:id"
+    ), {"id": task_id})).fetchone()
+    if not task_row:
+        return False
+
+    account_id, video_url, title = task_row[0], task_row[1], task_row[2]
+
+    # Look up the platform account
+    acct_row = (await db.execute(sql_text(
+        "SELECT platform, auth_token, refresh_token, open_id, expired_at FROM platform_accounts WHERE id=:id"
+    ), {"id": account_id})).fetchone()
+    if not acct_row:
+        return False
+
+    platform, auth_token, refresh_token, open_id, expired_at = acct_row
+
+    if platform != "douyin" or not auth_token or not open_id:
+        return False
+
+    # Check token expiry and refresh if needed
+    access_token = auth_token
+    if expired_at and refresh_token:
+        try:
+            exp = datetime.fromisoformat(expired_at.replace("Z", "+00:00"))
+            now_utc = datetime.now(timezone.utc)
+            if now_utc >= exp:
+                token_data = await douyin_refresh_token(refresh_token)
+                new_token = token_data.get("data", {}).get("access_token")
+                if new_token:
+                    access_token = new_token
+                    new_refresh = token_data["data"].get("refresh_token")
+                    expires_in = token_data["data"].get("expires_in", 1296000)
+                    new_exp = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+                    await db.execute(sql_text(
+                        "UPDATE platform_accounts SET auth_token=:t, refresh_token=:r, expired_at=:e WHERE id=:id"
+                    ), {"t": new_token, "r": new_refresh or refresh_token, "e": new_exp, "id": account_id})
+                    await db.commit()
+                else:
+                    return False
+        except Exception:
+            return False
+
+    # Step 1: Upload video
+    try:
+        await db.execute(sql_text(
+            "UPDATE publish_tasks SET progress=:p WHERE id=:id"
+        ), {"p": 10, "id": task_id})
+        await db.commit()
+
+        video_path = video_url
+        # If video_url is a local path, use it directly; otherwise skip real publish
+        if not os.path.exists(video_path):
+            return False
+
+        file_size = os.path.getsize(video_path)
+        file_name = Path(video_path).name
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            with open(video_path, "rb") as f:
+                upload_resp = await client.post(
+                    f"{DOUYIN_API_BASE}/api/douyin/v1/video/upload_video/",
+                    params={"open_id": open_id},
+                    headers={"access-token": access_token},
+                    files={"video": (file_name, f, "video/mp4")},
+                )
+            upload_result = upload_resp.json()
+
+        upload_data = upload_result.get("data", {})
+        if not upload_data or upload_data.get("error_code", -1) != 0:
+            err = upload_data.get("description", upload_result.get("err_msg", "upload failed"))
+            await db.execute(sql_text(
+                "UPDATE publish_tasks SET status='failed', error_message=:msg WHERE id=:id"
+            ), {"msg": f"上传失败: {err}", "id": task_id})
+            await db.commit()
+            return True  # Don't fallback, real error already recorded
+
+        video_info = upload_data.get("video", {})
+        video_id = video_info.get("video_id")
+        if not video_id:
+            await db.execute(sql_text(
+                "UPDATE publish_tasks SET status='failed', error_message=:msg WHERE id=:id"
+            ), {"msg": "上传成功但未返回video_id", "id": task_id})
+            await db.commit()
+            return True
+
+        await db.execute(sql_text(
+            "UPDATE publish_tasks SET progress=:p WHERE id=:id"
+        ), {"p": 50, "id": task_id})
+        await db.commit()
+
+        # Step 2: Create / publish
+        create_body = {"video_id": video_id}
+        if title:
+            create_body["text"] = title[:1000]
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            create_resp = await client.post(
+                f"{DOUYIN_API_BASE}/api/douyin/v1/video/create_video/",
+                params={"open_id": open_id},
+                headers={"access-token": access_token, "Content-Type": "application/json"},
+                json=create_body,
+            )
+            create_result = create_resp.json()
+
+        create_data = create_result.get("data", {})
+        if create_data.get("error_code", -1) != 0:
+            err = create_data.get("description", create_result.get("err_msg", "create failed"))
+            await db.execute(sql_text(
+                "UPDATE publish_tasks SET status='failed', error_message=:msg WHERE id=:id"
+            ), {"msg": f"发布失败: {err}", "id": task_id})
+            await db.commit()
+            return True
+
+        item_id = create_data.get("item_id", "")
+        publish_result = {
+            "platform_post_id": item_id,
+            "video_id": video_id,
+            "publish_url": f"https://www.douyin.com/video/{item_id}" if item_id else "",
+            "published_at": now_cst().isoformat(),
+        }
+        metrics = {"plays": 0, "likes": 0, "comments": 0, "shares": 0}
+
+        await db.execute(sql_text(
+            "UPDATE publish_tasks SET status='published', progress=100, publish_result=:pr, metrics=:m WHERE id=:id"
+        ), {"pr": json.dumps(publish_result), "m": json.dumps(metrics), "id": task_id})
+        await db.commit()
+        return True
+
+    except Exception as e:
+        await db.execute(sql_text(
+            "UPDATE publish_tasks SET status='failed', error_message=:msg WHERE id=:id"
+        ), {"msg": f"发布异常: {str(e)}", "id": task_id})
+        await db.commit()
+        return True
+
+
 async def _simulate_publish(task_id: str, user_id: str):
     """Simulate publishing progress with realistic delays and mock metrics."""
     import random
@@ -804,6 +946,12 @@ async def _simulate_publish(task_id: str, user_id: str):
 
     async with async_session() as db:
         try:
+            # Try real publish first
+            real_done = await _try_real_publish(task_id, user_id, db)
+            if real_done:
+                return
+
+            # Fallback: simulation
             stages = [
                 (20, "上传视频中...", 1.5),
                 (50, "转码处理中...", 2.0),
@@ -1010,6 +1158,7 @@ import hmac
 import hashlib
 
 DOUYIN_AUTH_BASE = "https://open.douyin.com"
+DOUYIN_API_BASE = "https://open.douyin.com"
 
 
 def _sign_state(user_id: str) -> str:
@@ -1588,6 +1737,286 @@ async def delete_lead(lead_id: str, user: dict = Depends(get_token_user), db: As
     await db.execute(text("DELETE FROM leads WHERE id = :lid AND user_id = :uid"), {"lid": lead_id, "uid": user["id"]})
     await db.commit()
     return {"ok": True}
+
+
+# ============ Comment-based Lead Collection ============
+
+INTENT_KEYWORDS = {
+    "high": ["多少钱", "怎么买", "怎么卖", "价格", "报价", "多少钱一台", "私信", "加微信", "加V", "加v", "联系我", "怎么联系", "求购", "想买", "我要", "在吗", "了解一下", "我想做", "代理", "加盟", "有没有", "怎么合作"],
+    "medium": ["好用吗", "效果", "怎么样", "好不好", "是真的吗", "靠谱吗", "有用吗", "能不能", "可以吗", "适合", "需要", "感兴趣", "不错", "好东西"],
+    "negative": ["太贵了", "骗子", "骗人", "垃圾", "假的", "忽悠", "坑", "不好", "差评"],
+}
+
+def score_comment_intent(text: str) -> dict:
+    """Score a comment for purchase intent."""
+    score = 0
+    matched = []
+    for kw in INTENT_KEYWORDS["high"]:
+        if kw in text:
+            score += 25
+            matched.append(kw)
+    for kw in INTENT_KEYWORDS["medium"]:
+        if kw in text:
+            score += 10
+            matched.append(kw)
+    for kw in INTENT_KEYWORDS["negative"]:
+        if kw in text:
+            score -= 15
+            matched.append(kw)
+    score = max(0, min(100, score))
+    if score >= 60:
+        level = "high"
+    elif score >= 30:
+        level = "medium"
+    else:
+        level = "low"
+    return {"score": score, "level": level, "matched_keywords": list(set(matched))}
+
+
+def extract_item_id(video_url: str) -> str | None:
+    """Extract douyin video item_id from URL."""
+    import re
+    if not video_url:
+        return None
+    m = re.search(r'/(?:video|note)/(\d{15,25})', video_url)
+    if m:
+        return m.group(1)
+    return None
+
+
+async def fetch_douyin_comments(access_token: str, open_id: str, item_id: str, cursor: int = 0, count: int = 20) -> dict:
+    """Fetch comments for a video from Douyin API."""
+    url = f"{DOUYIN_API_BASE}/video/comment/list/"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                url,
+                params={
+                    "open_id": open_id,
+                    "item_id": item_id,
+                    "cursor": cursor,
+                    "count": min(count, 50),
+                    "sort_type": "time",
+                },
+                headers={"access-token": access_token},
+            )
+            return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+class CollectCommentsReq(BaseModel):
+    platform_account_id: str
+    video_url: str
+    source_type: str = "own"  # "own" or "competitor"
+    min_intent_score: int = 30
+    max_results: int = 50
+
+
+@app.post("/leads/collect/comments")
+async def collect_leads_from_comments(req: CollectCommentsReq, user: dict = Depends(get_token_user), db: AsyncSession = Depends(get_db)):
+    """Fetch comments from a Douyin video, score intent, and save high-intent leads."""
+    item_id = extract_item_id(req.video_url)
+    if not item_id:
+        raise HTTPException(status_code=400, detail="无法从视频链接中提取视频ID，请提供有效的抖音视频链接")
+
+    # Look up platform account
+    acct = await db.execute(text(
+        "SELECT auth_token, refresh_token, open_id, expired_at FROM platform_accounts WHERE id = :aid AND user_id = :uid AND platform = 'douyin'"
+    ), {"aid": req.platform_account_id, "uid": user["id"]})
+    acct_row = acct.fetchone()
+    if not acct_row:
+        raise HTTPException(status_code=400, detail="未找到已授权的抖音账号，请先绑定抖音账号")
+
+    auth_token, refresh_token, open_id, expired_at = acct_row
+
+    # Refresh token if needed
+    if expired_at and refresh_token:
+        try:
+            exp = datetime.fromisoformat(expired_at.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) >= exp:
+                token_data = await douyin_refresh_token(refresh_token)
+                new_token = token_data.get("data", {}).get("access_token")
+                if new_token:
+                    auth_token = new_token
+                    new_refresh = token_data["data"].get("refresh_token")
+                    expires_in = token_data["data"].get("expires_in", 1296000)
+                    new_exp = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+                    await db.execute(text(
+                        "UPDATE platform_accounts SET auth_token=:t, refresh_token=:r, expired_at=:e WHERE id=:id"
+                    ), {"t": new_token, "r": new_refresh or refresh_token, "e": new_exp, "id": req.platform_account_id})
+                    await db.commit()
+        except Exception:
+            pass
+
+    # Fetch comments from Douyin API
+    api_result = await fetch_douyin_comments(auth_token, open_id, item_id, count=req.max_results)
+
+    all_comments = []
+    err_data = api_result.get("data", {})
+    if isinstance(err_data, dict) and err_data.get("error_code", 0) != 0:
+        err_code = err_data.get("error_code", -1)
+        if err_code in (28001016, 28001018):
+            raise HTTPException(
+                status_code=400,
+                detail="当前抖音应用未开通评论读取权限（video.comment scope），请在抖音开放平台申请互动管理权限后重新授权"
+            )
+        raise HTTPException(status_code=400, detail=f"抖音API错误: {err_data.get('description', 'unknown')}")
+
+    if "error" in api_result:
+        raise HTTPException(status_code=502, detail=f"获取评论失败: {api_result['error']}")
+
+    data = err_data
+    all_comments = data.get("list", []) if isinstance(data, dict) else []
+
+    if not all_comments:
+        return {
+            "item_id": item_id,
+            "video_url": req.video_url,
+            "source_type": req.source_type,
+            "total_comments_fetched": 0,
+            "leads_created": 0,
+            "comments_analyzed": [],
+        }
+
+    # Score and save leads
+    now = now_cst().isoformat()
+    leads_created = 0
+    analyzed = []
+
+    for c in all_comments:
+        text = c.get("content", "")
+        if not text:
+            continue
+        intent = score_comment_intent(text)
+        comment_info = {
+            "comment_id": c.get("comment_id", ""),
+            "nickname": c.get("nick_name", ""),
+            "avatar": c.get("avatar", ""),
+            "content": text[:200],
+            "digg_count": c.get("digg_count", 0),
+            "create_time": c.get("create_time", 0),
+            "intent_score": intent["score"],
+            "intent_level": intent["level"],
+            "matched_keywords": intent["matched_keywords"],
+        }
+        analyzed.append(comment_info)
+
+        if intent["score"] >= req.min_intent_score:
+            lead_id = str(uuid.uuid4())
+            await db.execute(text(
+                "INSERT INTO leads (id, user_id, form_id, name, phone, company, message, source, source_video_url, status, notes, created_at, updated_at) "
+                "VALUES (:id, :uid, NULL, :name, '', '', :msg, 'comment', :url, 'new', :notes, :now, :now)"
+            ), {
+                "id": lead_id, "uid": user["id"],
+                "name": comment_info["nickname"],
+                "msg": text[:500],
+                "url": req.video_url,
+                "notes": json.dumps({"comment_id": comment_info["comment_id"], "intent_score": intent["score"], "intent_level": intent["level"], "matched_keywords": intent["matched_keywords"], "source_type": req.source_type}, ensure_ascii=False),
+                "now": now,
+            })
+            leads_created += 1
+
+    await db.commit()
+
+    return {
+        "item_id": item_id,
+        "video_url": req.video_url,
+        "source_type": req.source_type,
+        "total_comments_fetched": len(all_comments),
+        "leads_created": leads_created,
+        "comments_analyzed": analyzed,
+    }
+
+
+@app.get("/leads/collect/comments/preview")
+async def preview_comments(
+    video_url: str,
+    platform_account_id: str,
+    user: dict = Depends(get_token_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Preview comments from a video with intent scores, without saving."""
+    item_id = extract_item_id(video_url)
+    if not item_id:
+        raise HTTPException(status_code=400, detail="无法提取视频ID")
+
+    acct = await db.execute(text(
+        "SELECT auth_token, refresh_token, open_id, expired_at FROM platform_accounts WHERE id = :aid AND user_id = :uid AND platform = 'douyin'"
+    ), {"aid": platform_account_id, "uid": user["id"]})
+    acct_row = acct.fetchone()
+    if not acct_row:
+        raise HTTPException(status_code=400, detail="未找到已授权的抖音账号")
+
+    auth_token, refresh_token, open_id, expired_at = acct_row
+
+    if expired_at and refresh_token:
+        try:
+            exp = datetime.fromisoformat(expired_at.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) >= exp:
+                token_data = await douyin_refresh_token(refresh_token)
+                new_token = token_data.get("data", {}).get("access_token")
+                if new_token:
+                    auth_token = new_token
+        except Exception:
+            pass
+
+    api_result = await fetch_douyin_comments(auth_token, open_id, item_id)
+    data = api_result.get("data", {})
+    comments_raw = data.get("list", []) if isinstance(data, dict) else []
+
+    comments = []
+    for c in comments_raw:
+        text = c.get("content", "")
+        intent = score_comment_intent(text)
+        comments.append({
+            "comment_id": c.get("comment_id", ""),
+            "nickname": c.get("nick_name", ""),
+            "avatar": c.get("avatar", ""),
+            "content": text[:200],
+            "digg_count": c.get("digg_count", 0),
+            "create_time": c.get("create_time", 0),
+            "intent_score": intent["score"],
+            "intent_level": intent["level"],
+            "matched_keywords": intent["matched_keywords"],
+        })
+
+    return {
+        "item_id": item_id,
+        "video_url": video_url,
+        "total_comments": len(comments),
+        "comments": comments,
+    }
+
+
+@app.get("/leads/collect/my-videos")
+async def get_my_videos_for_collection(
+    platform_account_id: str,
+    user: dict = Depends(get_token_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get user's own published videos for comment collection (自采)."""
+    result = await db.execute(text(
+        "SELECT id, video_url, title, publish_result, created_at FROM publish_tasks "
+        "WHERE user_id = :uid AND platform_account_id = :aid AND status = 'published' "
+        "ORDER BY created_at DESC LIMIT 50"
+    ), {"uid": user["id"], "aid": platform_account_id})
+    rows = result.fetchall()
+
+    videos = []
+    for r in rows:
+        pub_result = json.loads(r[3]) if r[3] else {}
+        item_id = pub_result.get("item_id", pub_result.get("platform_post_id", ""))
+        videos.append({
+            "task_id": r[0],
+            "video_url": r[1] if r[1] else (f"https://www.douyin.com/video/{item_id}" if item_id else ""),
+            "title": r[2],
+            "item_id": item_id,
+            "publish_url": pub_result.get("publish_url", ""),
+            "published_at": r[4],
+        })
+
+    return {"videos": videos}
 
 
 # ============ Outreach / DM Templates ============

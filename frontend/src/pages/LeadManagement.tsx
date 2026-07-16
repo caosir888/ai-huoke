@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Card, Table, Tag, Button, Modal, Input, Select, Tabs, Space, message, Spin, Statistic, Row, Col, Switch, Form, Empty, Popconfirm, Typography, Badge } from 'antd';
-import { PlusOutlined, CopyOutlined, AimOutlined, LinkOutlined, SendOutlined, MessageOutlined, PictureOutlined } from '@ant-design/icons';
+import { PlusOutlined, CopyOutlined, AimOutlined, LinkOutlined, SendOutlined, MessageOutlined, PictureOutlined, SearchOutlined, ImportOutlined, EyeOutlined, ReloadOutlined } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import api from '../api/client';
 
@@ -9,8 +9,8 @@ const { Paragraph } = Typography;
 
 const statusColors: Record<string, string> = { new: 'blue', contacted: 'orange', qualified: 'purple', converted: 'green', lost: 'red' };
 const statusNames: Record<string, string> = { new: '新线索', contacted: '已联系', qualified: '已验证', converted: '已转化', lost: '已流失' };
-const sourceColors: Record<string, string> = { form: 'blue', video: 'purple', manual: 'default' };
-const sourceNames: Record<string, string> = { form: '表单', video: '视频', manual: '手动' };
+const sourceColors: Record<string, string> = { form: 'blue', video: 'purple', manual: 'default', comment: 'green' };
+const sourceNames: Record<string, string> = { form: '表单', video: '视频', manual: '手动', comment: '评论' };
 
 const FIELD_OPTIONS = [
   { label: '姓名', value: 'name' },
@@ -48,6 +48,18 @@ export default function LeadManagement() {
   const [selectedLeads, setSelectedLeads] = useState<string[]>([]);
   const [selectedTemplate, setSelectedTemplate] = useState<string>('');
   const [executing, setExecuting] = useState(false);
+
+  // Comment mining state
+  const [commentMiningMode, setCommentMiningMode] = useState<'own' | 'competitor'>('own');
+  const [commentVideoUrl, setCommentVideoUrl] = useState('');
+  const [commentAccountId, setCommentAccountId] = useState('');
+  const [commentAccounts, setCommentAccounts] = useState<any[]>([]);
+  const [commentPreviewing, setCommentPreviewing] = useState(false);
+  const [commentImporting, setCommentImporting] = useState(false);
+  const [commentResults, setCommentResults] = useState<any[]>([]);
+  const [commentStats, setCommentStats] = useState<any>(null);
+  const [myVideos, setMyVideos] = useState<any[]>([]);
+  const [selectedMyVideo, setSelectedMyVideo] = useState('');
 
   const fetchLeads = useCallback(async () => {
     setLoading(true);
@@ -97,6 +109,65 @@ export default function LeadManagement() {
     } catch { /* ignore */ }
     setOutreachLoading(false);
   }, [outreachPage]);
+
+  // Comment mining functions
+  const fetchCommentAccounts = useCallback(async () => {
+    try {
+      const { data } = await api.get('/platform/accounts');
+      setCommentAccounts((data || []).filter((a: any) => a.platform === 'douyin' && a.auth_status === 'active'));
+    } catch { /* ignore */ }
+  }, []);
+
+  const fetchMyVideos = useCallback(async (accountId: string) => {
+    if (!accountId) return;
+    try {
+      const { data } = await api.get(`/leads/collect/my-videos?platform_account_id=${accountId}`);
+      setMyVideos(data.videos || []);
+    } catch { /* ignore */ }
+  }, []);
+
+  const handlePreviewComments = async () => {
+    const url = commentMiningMode === 'own' ? selectedMyVideo : commentVideoUrl;
+    if (!url) { message.error('请输入或选择视频链接'); return; }
+    if (!commentAccountId) { message.error('请先选择抖音账号'); return; }
+    setCommentPreviewing(true);
+    setCommentResults([]);
+    setCommentStats(null);
+    try {
+      const { data } = await api.get('/leads/collect/comments/preview', {
+        params: { video_url: url, platform_account_id: commentAccountId },
+      });
+      setCommentResults(data.comments || []);
+      setCommentStats(data);
+      message.success(`获取到 ${data.total_comments} 条评论`);
+    } catch (err: any) {
+      message.error(err.friendlyMessage || '获取评论失败');
+    }
+    setCommentPreviewing(false);
+  };
+
+  const handleImportCommentLeads = async () => {
+    if (!commentAccountId) return;
+    const url = commentMiningMode === 'own' ? selectedMyVideo : commentVideoUrl;
+    setCommentImporting(true);
+    try {
+      const { data } = await api.post('/leads/collect/comments', {
+        platform_account_id: commentAccountId,
+        video_url: url,
+        source_type: commentMiningMode,
+        min_intent_score: 30,
+        max_results: 50,
+      });
+      message.success(`已从评论中创建 ${data.leads_created} 条线索`);
+      setCommentResults(data.comments_analyzed || []);
+      setCommentStats(data);
+      fetchLeads();
+      fetchStats();
+    } catch (err: any) {
+      message.error(err.friendlyMessage || '导入失败');
+    }
+    setCommentImporting(false);
+  };
 
   const handleSaveTemplate = async () => {
     if (!editingTpl?.name?.trim()) { message.error('请输入模板名称'); return; }
@@ -205,7 +276,17 @@ export default function LeadManagement() {
     { title: '表单', dataIndex: 'form_title', key: 'form', width: 100, render: (v: string) => v || '-', ellipsis: true },
     { title: '状态', dataIndex: 'status', key: 'status', width: 90,
       render: (v: string) => <Tag color={statusColors[v]}>{statusNames[v] || v}</Tag> },
-    { title: '备注', dataIndex: 'notes', key: 'notes', width: 150, render: (v: string) => v || '-', ellipsis: true },
+    { title: '备注', dataIndex: 'notes', key: 'notes', width: 150, render: (v: string) => {
+      if (!v) return '-';
+      try {
+        const n = JSON.parse(v);
+        if (n.intent_score !== undefined) {
+          const color = n.intent_score >= 60 ? 'red' : n.intent_score >= 30 ? 'orange' : 'default';
+          return <Tag color={color}>意向{n.intent_score}分{n.source_type === 'competitor' ? '·它采' : '·自采'}</Tag>;
+        }
+      } catch { /* not JSON */ }
+      return <span title={v}>{v.length > 20 ? v.slice(0, 20) + '...' : v}</span>;
+    }, ellipsis: true },
     { title: '时间', dataIndex: 'created_at', key: 'time', width: 110,
       render: (d: string) => dayjs(d).format('MM-DD HH:mm') },
     { title: '操作', key: 'actions', width: 140,
@@ -233,6 +314,7 @@ export default function LeadManagement() {
 
       <Tabs defaultActiveKey="leads" onChange={(key) => {
         if (key === 'outreach') { fetchOutreachTasks(); fetchOutreachStats(); fetchTemplates(); fetchLeads(); }
+        if (key === 'comment_mining') { fetchCommentAccounts(); }
       }} items={[
         {
           key: 'leads',
@@ -263,8 +345,108 @@ export default function LeadManagement() {
           ),
         },
         {
+          key: 'comment_mining',
+          label: '评论获客',
+          children: (
+            <div>
+              <Card style={{ marginBottom: 16 }}>
+                <Space style={{ marginBottom: 16 }}>
+                  <Button type={commentMiningMode === 'own' ? 'primary' : 'default'} onClick={() => { setCommentMiningMode('own'); setCommentResults([]); setCommentStats(null); }}>
+                    自采评论
+                  </Button>
+                  <Button type={commentMiningMode === 'competitor' ? 'primary' : 'default'} onClick={() => { setCommentMiningMode('competitor'); setCommentResults([]); setCommentStats(null); }}>
+                    它采评论
+                  </Button>
+                </Space>
+
+                <Space style={{ marginBottom: 16 }} wrap>
+                  <Select placeholder="选择抖音账号" style={{ width: 220 }} value={commentAccountId || undefined}
+                    onChange={(v) => { setCommentAccountId(v); fetchMyVideos(v); }}
+                    options={commentAccounts.map((a: any) => ({ value: a.id, label: a.account_name }))}
+                    onDropdownVisibleChange={(open) => { if (open) fetchCommentAccounts(); }} />
+
+                  {commentMiningMode === 'own' ? (
+                    <Select placeholder="选择已发布的视频" style={{ width: 280 }} value={selectedMyVideo || undefined}
+                      onChange={(v) => { setSelectedMyVideo(v); setCommentVideoUrl(v); }}
+                      options={myVideos.map((v: any) => ({ value: v.video_url || v.publish_url, label: v.title || v.video_url || v.publish_url }))} />
+                  ) : (
+                    <Input placeholder="输入抖音视频链接 https://v.douyin.com/..." style={{ width: 350 }}
+                      value={commentVideoUrl} onChange={(e) => setCommentVideoUrl(e.target.value)}
+                      prefix={<LinkOutlined />} />
+                  )}
+
+                  <Button type="primary" icon={<SearchOutlined />} loading={commentPreviewing}
+                    onClick={handlePreviewComments}>
+                    预览评论
+                  </Button>
+                  <Button icon={<ImportOutlined />} loading={commentImporting}
+                    onClick={handleImportCommentLeads}
+                    disabled={commentResults.length === 0}>
+                    一键导入高意向线索
+                  </Button>
+                  <Button icon={<ReloadOutlined />} onClick={() => { setCommentResults([]); setCommentStats(null); }}>
+                    清空
+                  </Button>
+                </Space>
+
+                {commentMiningMode === 'competitor' && (
+                  <div style={{ marginBottom: 12, color: '#999', fontSize: 12 }}>
+                    <AimOutlined /> 它采模式：输入任意抖音视频链接，系统自动分析评论中的意向用户并导入为线索
+                  </div>
+                )}
+                {commentMiningMode === 'own' && (
+                  <div style={{ marginBottom: 12, color: '#999', fontSize: 12 }}>
+                    <AimOutlined /> 自采模式：选择自己已发布的视频，从评论区挖掘潜在客户
+                  </div>
+                )}
+              </Card>
+
+              {commentStats && (
+                <Card style={{ marginBottom: 16 }}>
+                  <Row gutter={16}>
+                    <Col span={6}><Statistic title="视频ID" value={commentStats.item_id || '-'} /></Col>
+                    <Col span={6}><Statistic title="评论总数" value={commentStats.total_comments || commentStats.total_comments_fetched || 0} /></Col>
+                    <Col span={6}><Statistic title="已创建线索" valueStyle={{ color: '#52c41a' }} value={commentStats.leads_created ?? 0} /></Col>
+                    <Col span={6}><Statistic title="高意向" valueStyle={{ color: '#ff4d4f' }}
+                      value={commentResults.filter((c: any) => c.intent_level === 'high').length} /></Col>
+                  </Row>
+                </Card>
+              )}
+
+              {commentResults.length > 0 && (
+                <Card title="评论分析结果">
+                  <Table columns={[
+                    { title: '头像', dataIndex: 'avatar', key: 'avatar', width: 50,
+                      render: (v: string) => v ? <img src={v} alt="" style={{ width: 32, height: 32, borderRadius: '50%' }} /> : '-' },
+                    { title: '昵称', dataIndex: 'nickname', key: 'nickname', width: 120, render: (v: string) => v || '-' },
+                    { title: '评论内容', dataIndex: 'content', key: 'content', ellipsis: true },
+                    { title: '点赞', dataIndex: 'digg_count', key: 'digg', width: 60 },
+                    { title: '意向分数', dataIndex: 'intent_score', key: 'score', width: 90,
+                      sorter: (a: any, b: any) => a.intent_score - b.intent_score,
+                      defaultSortOrder: 'descend' as const,
+                      render: (v: number) => <Tag color={v >= 60 ? 'red' : v >= 30 ? 'orange' : 'default'}>{v}分</Tag> },
+                    { title: '意向等级', dataIndex: 'intent_level', key: 'level', width: 90,
+                      render: (v: string) => {
+                        const map: Record<string, { c: string; t: string }> = { high: { c: 'red', t: '高意向' }, medium: { c: 'orange', t: '中意向' }, low: { c: 'default', t: '低意向' } };
+                        return <Tag color={map[v]?.c}>{map[v]?.t || v}</Tag>;
+                      }},
+                    { title: '匹配关键词', dataIndex: 'matched_keywords', key: 'kw', width: 180,
+                      render: (v: string[]) => v?.length ? v.map(k => <Tag key={k} style={{ marginBottom: 2 }}>{k}</Tag>) : '-' },
+                  ]} dataSource={commentResults} rowKey="comment_id" size="small"
+                    pagination={{ pageSize: 20, showTotal: (t) => `共 ${t} 条` }}
+                    locale={{ emptyText: '暂无评论数据' }} />
+                </Card>
+              )}
+
+              {!commentStats && !commentPreviewing && (
+                <Empty description={commentMiningMode === 'own' ? '选择抖音账号和已发布视频，点击"预览评论"开始分析' : '输入抖音视频链接，点击"预览评论"开始分析'} />
+              )}
+            </div>
+          ),
+        },
+        {
           key: 'outreach',
-          label: '触达中心',
+          label: '私信触达',
           children: (
             <div>
               <Row gutter={16} style={{ marginBottom: 16 }}>
