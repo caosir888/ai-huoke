@@ -38,7 +38,7 @@ DOUYIN_REDIRECT_URI = os.environ.get("DOUYIN_REDIRECT_URI", "http://localhost:80
 DOUYIN_OAUTH_SCOPE = os.environ.get("DOUYIN_OAUTH_SCOPE", "user_info,video.create.bind,video.data,video.comment")
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-in-production")
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -105,10 +105,19 @@ class UpdateProfileReq(BaseModel):
     industry: str | None = None
     company_name: str | None = None
 
+# Douyin review test account
+TEST_PHONE = "13800138000"
+TEST_CODE = "8888"
+
+
 @app.post("/auth/send-code")
 async def send_code(req: SendCodeReq):
     """Send verification code via SMS (or debug mode). Includes rate limiting."""
     import sms
+
+    # Test account: always return fixed code for Douyin reviewers
+    if req.phone == TEST_PHONE:
+        return {"message": "验证码已发送", "debug_code": TEST_CODE}
 
     # Rate limit: 60s cooldown per phone
     if not sms.can_send(req.phone):
@@ -134,8 +143,11 @@ async def send_code(req: SendCodeReq):
 async def login(req: LoginReq, db: AsyncSession = Depends(get_db)):
     import sms
 
-    # Verify code
-    valid, err_msg = sms.verify_code(req.phone, req.code)
+    # Test account bypass for Douyin reviewers
+    if req.phone == TEST_PHONE and req.code == TEST_CODE:
+        valid, err_msg = True, ""
+    else:
+        valid, err_msg = sms.verify_code(req.phone, req.code)
     if not valid:
         raise HTTPException(status_code=400, detail=err_msg)
 
@@ -1406,6 +1418,33 @@ async def douyin_callback(code: str, state: str = "", db: AsyncSession = Depends
 
     return RedirectResponse(url=f"{frontend_url}/oauth/callback?bind_status=success&platform=douyin")
 
+# ============ Douyin Webhook / Event Subscription ============
+
+@app.post("/platform/webhook/douyin")
+async def douyin_webhook(request: Request):
+    """
+    Douyin event subscription webhook.
+    URL verification: POST with {"event":"verify_webhook","content":{"challenge":12345}}
+    Must return {"challenge": 12345} as JSON.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return {"error": "invalid json"}
+
+    # URL verification
+    content = body.get("content", {})
+    challenge = content.get("challenge") if isinstance(content, dict) else None
+    if challenge is not None:
+        return {"challenge": challenge}
+
+    # Event push
+    event_type = body.get("event", "unknown")
+    print(f"[WEBHOOK] Received event: {event_type}")
+    print(f"[WEBHOOK] Body: {json.dumps(body, ensure_ascii=False)[:500]}")
+
+    return {"code": 0, "message": "ok"}
+
 # ============ Payment ============
 
 @app.get("/payment/plans")
@@ -1824,6 +1863,27 @@ def extract_item_id(video_url: str) -> str | None:
     return None
 
 
+def extract_live_room_id(live_url: str) -> str | None:
+    """Extract douyin live room ID from URL.
+
+    Supports formats:
+    - https://live.douyin.com/ROOM_ID
+    - https://v.douyin.com/xxxxx/ (shared short link, resolves to live room)
+    """
+    import re
+    if not live_url:
+        return None
+    # Direct live URL: https://live.douyin.com/123456789
+    m = re.search(r'live\.douyin\.com/(\d{8,20})', live_url)
+    if m:
+        return m.group(1)
+    # webcast URL pattern
+    m = re.search(r'webcast\.douyin\.com/(\d{8,20})', live_url)
+    if m:
+        return m.group(1)
+    return None
+
+
 async def fetch_douyin_comments(access_token: str, open_id: str, item_id: str, cursor: int = 0, count: int = 20) -> dict:
     """Fetch comments for a video from Douyin API."""
     url = f"{DOUYIN_API_BASE}/video/comment/list/"
@@ -1837,6 +1897,26 @@ async def fetch_douyin_comments(access_token: str, open_id: str, item_id: str, c
                     "cursor": cursor,
                     "count": min(count, 50),
                     "sort_type": "time",
+                },
+                headers={"access-token": access_token},
+            )
+            return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def fetch_live_room_comments(access_token: str, open_id: str, room_id: str, cursor: int = 0, count: int = 20) -> dict:
+    """Fetch live room audience interactions from Douyin API."""
+    url = f"{DOUYIN_API_BASE}/live/room/data/audience/"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                url,
+                params={
+                    "open_id": open_id,
+                    "room_id": room_id,
+                    "cursor": cursor,
+                    "count": min(count, 50),
                 },
                 headers={"access-token": access_token},
             )
@@ -2057,6 +2137,247 @@ async def get_my_videos_for_collection(
         })
 
     return {"videos": videos}
+
+
+# ============ Live Stream Customer Acquisition ============
+
+class CollectLiveLeadsReq(BaseModel):
+    platform_account_id: str
+    live_url: str
+    min_intent_score: int = 30
+    max_results: int = 50
+
+
+def _extract_display_fields(item: dict) -> dict:
+    """Extract display fields from a live room audience/comment item."""
+    return {
+        "user_id": item.get("open_id", item.get("user_id", "")),
+        "nickname": item.get("nick_name", item.get("nickname", "")),
+        "avatar": item.get("avatar", ""),
+        "content": item.get("content", item.get("comment_text", item.get("interaction", "")))[:200],
+        "digg_count": item.get("like_count", item.get("digg_count", 0)),
+        "create_time": item.get("create_time", item.get("timestamp", 0)),
+    }
+
+
+@app.get("/leads/collect/live/preview")
+async def preview_live_comments(
+    live_url: str,
+    platform_account_id: str,
+    user: dict = Depends(get_token_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Preview live stream comments/audience interactions with intent scores."""
+    room_id = extract_live_room_id(live_url)
+    if not room_id:
+        raise HTTPException(status_code=400, detail="无法识别直播链接，请输入有效的抖音直播链接（如 https://live.douyin.com/ROOM_ID）")
+
+    # Look up platform account
+    acct = await db.execute(text(
+        "SELECT auth_token, refresh_token, open_id, expired_at FROM platform_accounts WHERE id = :aid AND user_id = :uid AND platform = 'douyin'"
+    ), {"aid": platform_account_id, "uid": user["id"]})
+    acct_row = acct.fetchone()
+    if not acct_row:
+        raise HTTPException(status_code=400, detail="未找到已授权的抖音账号，请先绑定抖音账号")
+
+    auth_token, refresh_token, open_id, expired_at = acct_row
+
+    # Refresh token if needed
+    if expired_at and refresh_token:
+        try:
+            exp = datetime.fromisoformat(expired_at.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) >= exp:
+                token_data = await douyin_refresh_token(refresh_token)
+                new_token = token_data.get("data", {}).get("access_token")
+                if new_token:
+                    auth_token = new_token
+        except Exception:
+            pass
+
+    api_result = await fetch_live_room_comments(auth_token, open_id, room_id)
+
+    comments_raw = []
+    data = api_result.get("data", {})
+    if isinstance(data, dict):
+        comments_raw = data.get("list", data.get("audience_list", []))
+    elif isinstance(data, list):
+        comments_raw = data
+
+    comments = []
+    for c in comments_raw:
+        info = _extract_display_fields(c)
+        text = info["content"]
+        intent = score_comment_intent(text)
+        comments.append({
+            **info,
+            "intent_score": intent["score"],
+            "intent_level": intent["level"],
+            "matched_keywords": intent["matched_keywords"],
+        })
+
+    return {
+        "room_id": room_id,
+        "live_url": live_url,
+        "total_comments": len(comments),
+        "comments": comments,
+    }
+
+
+@app.post("/leads/collect/live")
+async def collect_leads_from_live(
+    req: CollectLiveLeadsReq,
+    user: dict = Depends(get_token_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Fetch live room audience interactions, score intent, and save high-intent leads."""
+    room_id = extract_live_room_id(req.live_url)
+    if not room_id:
+        raise HTTPException(status_code=400, detail="无法识别直播链接，请输入有效的抖音直播链接（如 https://live.douyin.com/ROOM_ID）")
+
+    # Look up platform account
+    acct = await db.execute(text(
+        "SELECT auth_token, refresh_token, open_id, expired_at FROM platform_accounts WHERE id = :aid AND user_id = :uid AND platform = 'douyin'"
+    ), {"aid": req.platform_account_id, "uid": user["id"]})
+    acct_row = acct.fetchone()
+    if not acct_row:
+        raise HTTPException(status_code=400, detail="未找到已授权的抖音账号，请先绑定抖音账号")
+
+    auth_token, refresh_token, open_id, expired_at = acct_row
+
+    # Refresh token if needed
+    if expired_at and refresh_token:
+        try:
+            exp = datetime.fromisoformat(expired_at.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) >= exp:
+                token_data = await douyin_refresh_token(refresh_token)
+                new_token = token_data.get("data", {}).get("access_token")
+                if new_token:
+                    auth_token = new_token
+                    new_refresh = token_data["data"].get("refresh_token")
+                    expires_in = token_data["data"].get("expires_in", 1296000)
+                    new_exp = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+                    await db.execute(text(
+                        "UPDATE platform_accounts SET auth_token=:t, refresh_token=:r, expired_at=:e WHERE id=:id"
+                    ), {"t": new_token, "r": new_refresh or refresh_token, "e": new_exp, "id": req.platform_account_id})
+                    await db.commit()
+        except Exception:
+            pass
+
+    api_result = await fetch_live_room_comments(auth_token, open_id, room_id, count=req.max_results)
+
+    comments_raw = []
+    err_data = api_result.get("data", {})
+    if isinstance(err_data, dict) and err_data.get("error_code", 0) != 0:
+        raise HTTPException(status_code=400, detail=f"抖音API错误: {err_data.get('description', 'unknown')}")
+
+    if "error" in api_result:
+        raise HTTPException(status_code=502, detail=f"获取直播评论失败: {api_result['error']}")
+
+    data = err_data
+    comments_raw = data.get("list", data.get("audience_list", [])) if isinstance(data, dict) else []
+
+    if not comments_raw:
+        return {
+            "room_id": room_id,
+            "live_url": req.live_url,
+            "total_comments_fetched": 0,
+            "leads_created": 0,
+            "comments_analyzed": [],
+        }
+
+    now = now_cst().isoformat()
+    leads_created = 0
+    analyzed = []
+
+    for c in comments_raw:
+        info = _extract_display_fields(c)
+        text = info["content"]
+        if not text:
+            continue
+        intent = score_comment_intent(text)
+        comment_info = {
+            **info,
+            "intent_score": intent["score"],
+            "intent_level": intent["level"],
+            "matched_keywords": intent["matched_keywords"],
+        }
+        analyzed.append(comment_info)
+
+        if intent["score"] >= req.min_intent_score:
+            lead_id = str(uuid.uuid4())
+            await db.execute(text(
+                "INSERT INTO leads (id, user_id, form_id, name, phone, company, message, source, source_video_url, status, notes, created_at, updated_at) "
+                "VALUES (:id, :uid, NULL, :name, '', '', :msg, 'live', :url, 'new', :notes, :now, :now)"
+            ), {
+                "id": lead_id, "uid": user["id"],
+                "name": comment_info["nickname"],
+                "msg": text[:500],
+                "url": req.live_url,
+                "notes": json.dumps({
+                    "live_room_id": room_id,
+                    "user_id": comment_info["user_id"],
+                    "intent_score": intent["score"],
+                    "intent_level": intent["level"],
+                    "matched_keywords": intent["matched_keywords"],
+                    "source_type": "live",
+                }, ensure_ascii=False),
+                "now": now,
+            })
+            leads_created += 1
+
+    await db.commit()
+
+    return {
+        "room_id": room_id,
+        "live_url": req.live_url,
+        "total_comments_fetched": len(comments_raw),
+        "leads_created": leads_created,
+        "comments_analyzed": analyzed,
+    }
+
+
+@app.get("/leads/collect/live/active-rooms")
+async def get_active_live_rooms(
+    platform_account_id: str,
+    user: dict = Depends(get_token_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get list of currently active live rooms from followed accounts (if available via API)."""
+    acct = await db.execute(text(
+        "SELECT auth_token, open_id FROM platform_accounts WHERE id = :aid AND user_id = :uid AND platform = 'douyin'"
+    ), {"aid": platform_account_id, "uid": user["id"]})
+    acct_row = acct.fetchone()
+    if not acct_row:
+        raise HTTPException(status_code=400, detail="未找到已授权的抖音账号")
+
+    auth_token, open_id = acct_row
+
+    url = f"{DOUYIN_API_BASE}/live/room/list/"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                url,
+                params={"open_id": open_id, "count": 50},
+                headers={"access-token": auth_token},
+            )
+            result = resp.json()
+            data = result.get("data", {})
+            rooms = data.get("list", []) if isinstance(data, dict) else []
+            return {
+                "rooms": [
+                    {
+                        "room_id": str(r.get("room_id", "")),
+                        "title": r.get("title", ""),
+                        "cover": r.get("cover", ""),
+                        "user_count": r.get("user_count", 0),
+                        "nickname": r.get("nickname", ""),
+                        "live_url": f"https://live.douyin.com/{r.get('room_id', '')}",
+                    }
+                    for r in rooms
+                ]
+            }
+    except Exception as e:
+        return {"rooms": [], "error": str(e)}
 
 
 # ============ Outreach / DM Templates ============
@@ -2366,6 +2687,26 @@ async def init_db():
             sent_at TEXT, created_at TEXT
         )"""))
     print("SQLite 数据库已初始化 (aihuoke.db)")
+
+# ── Serve frontend SPA (for same-origin deployment via ngrok) ──
+FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
+if FRONTEND_DIR.exists():
+    from fastapi.responses import FileResponse
+
+    # Serve static assets (JS, CSS, images, etc.)
+    assets_dir = FRONTEND_DIR / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="spa_assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """Catch-all: serve index.html for all unmatched GET routes (SPA routing)."""
+        file_path = FRONTEND_DIR / full_path
+        # If the request matches an actual file (e.g. favicon.svg), serve it
+        if file_path.is_file():
+            return FileResponse(file_path)
+        # Otherwise, return index.html for client-side routing
+        return FileResponse(FRONTEND_DIR / "index.html")
 
 if __name__ == "__main__":
     import uvicorn

@@ -9,8 +9,8 @@ const { Paragraph } = Typography;
 
 const statusColors: Record<string, string> = { new: 'blue', contacted: 'orange', qualified: 'purple', converted: 'green', lost: 'red' };
 const statusNames: Record<string, string> = { new: '新线索', contacted: '已联系', qualified: '已验证', converted: '已转化', lost: '已流失' };
-const sourceColors: Record<string, string> = { form: 'blue', video: 'purple', manual: 'default', comment: 'green' };
-const sourceNames: Record<string, string> = { form: '表单', video: '视频', manual: '手动', comment: '评论' };
+const sourceColors: Record<string, string> = { form: 'blue', video: 'purple', manual: 'default', comment: 'green', live: 'red' };
+const sourceNames: Record<string, string> = { form: '表单', video: '视频', manual: '手动', comment: '评论', live: '直播' };
 
 const FIELD_OPTIONS = [
   { label: '姓名', value: 'name' },
@@ -60,6 +60,17 @@ export default function LeadManagement() {
   const [commentStats, setCommentStats] = useState<any>(null);
   const [myVideos, setMyVideos] = useState<any[]>([]);
   const [selectedMyVideo, setSelectedMyVideo] = useState('');
+
+  // Live stream mining state
+  const [liveUrl, setLiveUrl] = useState('');
+  const [liveAccountId, setLiveAccountId] = useState('');
+  const [liveAccounts, setLiveAccounts] = useState<any[]>([]);
+  const [livePreviewing, setLivePreviewing] = useState(false);
+  const [liveImporting, setLiveImporting] = useState(false);
+  const [liveResults, setLiveResults] = useState<any[]>([]);
+  const [liveStats, setLiveStats] = useState<any>(null);
+  const [activeRooms, setActiveRooms] = useState<any[]>([]);
+  const [roomsLoading, setRoomsLoading] = useState(false);
 
   const fetchLeads = useCallback(async () => {
     setLoading(true);
@@ -167,6 +178,64 @@ export default function LeadManagement() {
       message.error(err.friendlyMessage || '导入失败');
     }
     setCommentImporting(false);
+  };
+
+  // Live stream mining functions
+  const fetchLiveAccounts = useCallback(async () => {
+    try {
+      const { data } = await api.get('/platform/accounts');
+      setLiveAccounts((data || []).filter((a: any) => a.platform === 'douyin' && a.auth_status === 'active'));
+    } catch { /* ignore */ }
+  }, []);
+
+  const fetchActiveRooms = async (accountId: string) => {
+    if (!accountId) return;
+    setRoomsLoading(true);
+    try {
+      const { data } = await api.get(`/leads/collect/live/active-rooms?platform_account_id=${accountId}`);
+      setActiveRooms(data.rooms || []);
+    } catch { /* ignore */ }
+    setRoomsLoading(false);
+  };
+
+  const handlePreviewLive = async () => {
+    if (!liveUrl) { message.error('请输入抖音直播链接'); return; }
+    if (!liveAccountId) { message.error('请先选择抖音账号'); return; }
+    setLivePreviewing(true);
+    setLiveResults([]);
+    setLiveStats(null);
+    try {
+      const { data } = await api.get('/leads/collect/live/preview', {
+        params: { live_url: liveUrl, platform_account_id: liveAccountId },
+      });
+      setLiveResults(data.comments || []);
+      setLiveStats(data);
+      message.success(`获取到 ${data.total_comments} 条互动评论`);
+    } catch (err: any) {
+      message.error(err.friendlyMessage || '获取直播评论失败');
+    }
+    setLivePreviewing(false);
+  };
+
+  const handleImportLiveLeads = async () => {
+    if (!liveUrl || !liveAccountId) return;
+    setLiveImporting(true);
+    try {
+      const { data } = await api.post('/leads/collect/live', {
+        platform_account_id: liveAccountId,
+        live_url: liveUrl,
+        min_intent_score: 30,
+        max_results: 50,
+      });
+      message.success(`已从直播评论中创建 ${data.leads_created} 条线索`);
+      setLiveResults(data.comments_analyzed || []);
+      setLiveStats(data);
+      fetchLeads();
+      fetchStats();
+    } catch (err: any) {
+      message.error(err.friendlyMessage || '导入失败');
+    }
+    setLiveImporting(false);
   };
 
   const handleSaveTemplate = async () => {
@@ -282,7 +351,7 @@ export default function LeadManagement() {
         const n = JSON.parse(v);
         if (n.intent_score !== undefined) {
           const color = n.intent_score >= 60 ? 'red' : n.intent_score >= 30 ? 'orange' : 'default';
-          return <Tag color={color}>意向{n.intent_score}分{n.source_type === 'competitor' ? '·它采' : '·自采'}</Tag>;
+          return <Tag color={color}>意向{n.intent_score}分{n.source_type === 'competitor' ? '·它采' : n.source_type === 'live' ? '·直播' : '·自采'}</Tag>;
         }
       } catch { /* not JSON */ }
       return <span title={v}>{v.length > 20 ? v.slice(0, 20) + '...' : v}</span>;
@@ -315,6 +384,7 @@ export default function LeadManagement() {
       <Tabs defaultActiveKey="leads" onChange={(key) => {
         if (key === 'outreach') { fetchOutreachTasks(); fetchOutreachStats(); fetchTemplates(); fetchLeads(); }
         if (key === 'comment_mining') { fetchCommentAccounts(); }
+        if (key === 'live_mining') { fetchLiveAccounts(); }
       }} items={[
         {
           key: 'leads',
@@ -440,6 +510,111 @@ export default function LeadManagement() {
 
               {!commentStats && !commentPreviewing && (
                 <Empty description={commentMiningMode === 'own' ? '选择抖音账号和已发布视频，点击"预览评论"开始分析' : '输入抖音视频链接，点击"预览评论"开始分析'} />
+              )}
+            </div>
+          ),
+        },
+        {
+          key: 'live_mining',
+          label: '直播获客',
+          children: (
+            <div>
+              <Card style={{ marginBottom: 16 }}>
+                <Space style={{ marginBottom: 16 }} wrap>
+                  <Select placeholder="选择抖音账号" style={{ width: 220 }} value={liveAccountId || undefined}
+                    onChange={(v) => { setLiveAccountId(v); fetchActiveRooms(v); }}
+                    options={liveAccounts.map((a: any) => ({ value: a.id, label: a.account_name }))}
+                    onDropdownVisibleChange={(open) => { if (open) fetchLiveAccounts(); }} />
+
+                  <Input placeholder="输入抖音直播链接 https://live.douyin.com/..." style={{ width: 380 }}
+                    value={liveUrl} onChange={(e) => setLiveUrl(e.target.value)}
+                    prefix={<LinkOutlined />} />
+
+                  <Button type="primary" icon={<SearchOutlined />} loading={livePreviewing}
+                    onClick={handlePreviewLive}>
+                    预览互动
+                  </Button>
+                  <Button icon={<ImportOutlined />} loading={liveImporting}
+                    onClick={handleImportLiveLeads}
+                    disabled={liveResults.length === 0}>
+                    一键导入高意向线索
+                  </Button>
+                  <Button icon={<ReloadOutlined />} onClick={() => { setLiveResults([]); setLiveStats(null); }}>
+                    清空
+                  </Button>
+                </Space>
+
+                <div style={{ marginBottom: 12, color: '#999', fontSize: 12 }}>
+                  <AimOutlined /> 直播获客：输入任意抖音直播链接，系统自动分析直播评论/互动中的意向用户并导入为线索。支持实时直播和历史直播回放评论。
+                </div>
+              </Card>
+
+              {/* Active Rooms */}
+              {activeRooms.length > 0 && (
+                <Card title="当前直播中的房间" size="small" style={{ marginBottom: 16 }} loading={roomsLoading}>
+                  <Row gutter={[12, 12]}>
+                    {activeRooms.map((room: any) => (
+                      <Col xs={24} sm={12} md={8} key={room.room_id}>
+                        <Card
+                          size="small"
+                          hoverable
+                          onClick={() => setLiveUrl(room.live_url)}
+                          style={{ border: liveUrl === room.live_url ? '2px solid #1890ff' : undefined }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            {room.cover && <img src={room.cover} alt="" style={{ width: 48, height: 48, borderRadius: 6, objectFit: 'cover' }} />}
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ fontWeight: 500, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{room.title || '无标题'}</div>
+                              <div style={{ fontSize: 12, color: '#999' }}>{room.nickname} · {room.user_count || 0} 观看</div>
+                            </div>
+                            <Badge status="processing" />
+                          </div>
+                        </Card>
+                      </Col>
+                    ))}
+                  </Row>
+                </Card>
+              )}
+
+              {liveStats && (
+                <Card style={{ marginBottom: 16 }}>
+                  <Row gutter={16}>
+                    <Col span={6}><Statistic title="直播间ID" value={liveStats.room_id || '-'} /></Col>
+                    <Col span={6}><Statistic title="互动总数" value={liveStats.total_comments || liveStats.total_comments_fetched || 0} /></Col>
+                    <Col span={6}><Statistic title="已创建线索" valueStyle={{ color: '#52c41a' }} value={liveStats.leads_created ?? 0} /></Col>
+                    <Col span={6}><Statistic title="高意向" valueStyle={{ color: '#ff4d4f' }}
+                      value={liveResults.filter((c: any) => c.intent_level === 'high').length} /></Col>
+                  </Row>
+                </Card>
+              )}
+
+              {liveResults.length > 0 && (
+                <Card title="直播互动分析结果">
+                  <Table columns={[
+                    { title: '头像', dataIndex: 'avatar', key: 'avatar', width: 50,
+                      render: (v: string) => v ? <img src={v} alt="" style={{ width: 32, height: 32, borderRadius: '50%' }} /> : '-' },
+                    { title: '昵称', dataIndex: 'nickname', key: 'nickname', width: 120, render: (v: string) => v || '-' },
+                    { title: '互动内容', dataIndex: 'content', key: 'content', ellipsis: true },
+                    { title: '点赞', dataIndex: 'digg_count', key: 'digg', width: 60 },
+                    { title: '意向分数', dataIndex: 'intent_score', key: 'score', width: 90,
+                      sorter: (a: any, b: any) => a.intent_score - b.intent_score,
+                      defaultSortOrder: 'descend' as const,
+                      render: (v: number) => <Tag color={v >= 60 ? 'red' : v >= 30 ? 'orange' : 'default'}>{v}分</Tag> },
+                    { title: '意向等级', dataIndex: 'intent_level', key: 'level', width: 90,
+                      render: (v: string) => {
+                        const map: Record<string, { c: string; t: string }> = { high: { c: 'red', t: '高意向' }, medium: { c: 'orange', t: '中意向' }, low: { c: 'default', t: '低意向' } };
+                        return <Tag color={map[v]?.c}>{map[v]?.t || v}</Tag>;
+                      }},
+                    { title: '匹配关键词', dataIndex: 'matched_keywords', key: 'kw', width: 180,
+                      render: (v: string[]) => v?.length ? v.map(k => <Tag key={k} style={{ marginBottom: 2 }}>{k}</Tag>) : '-' },
+                  ]} dataSource={liveResults} rowKey={(r: any) => r.comment_id || r.user_id} size="small"
+                    pagination={{ pageSize: 20, showTotal: (t) => `共 ${t} 条` }}
+                    locale={{ emptyText: '暂无直播互动数据' }} />
+                </Card>
+              )}
+
+              {!liveStats && !livePreviewing && (
+                <Empty description={'输入抖音直播链接，选择授权账号，点击"预览互动"开始分析直播观众中的意向用户'} />
               )}
             </div>
           ),
